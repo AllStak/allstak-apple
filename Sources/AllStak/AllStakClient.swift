@@ -62,6 +62,34 @@ public final class AllStakClient: @unchecked Sendable {
             timestamp: Date().timeIntervalSince1970)
     }
 
+    // visible for testing — builds a fatal event from a persisted crash report,
+    // using the crash-time image layout passed in.
+    func buildCrashEvent(_ report: CrashReport, images: [AllStakBinaryImage]) -> AllStakErrorEvent {
+        let frames = report.addresses.prefix(Self.maxFrames).map { addr in
+            AllStakFrame(
+                function: nil,
+                filename: nil,
+                instructionAddr: "0x" + String(addr, radix: 16),
+                inApp: true)
+        }
+        return AllStakErrorEvent(
+            exceptionClass: report.name,
+            message: report.message,
+            level: "fatal",
+            platform: "cocoa",
+            environment: environment,
+            release: release,
+            frames: Array(frames),
+            debugMeta: AllStakDebugMeta(images: images),
+            sdkName: Self.sdkName,
+            sdkVersion: Self.sdkVersion,
+            timestamp: report.timestamp)
+    }
+
+    func sendCrash(_ report: CrashReport, images: [AllStakBinaryImage]) {
+        send(buildCrashEvent(report, images: images))
+    }
+
     private func send(_ event: AllStakErrorEvent) {
         guard let url = URL(string: host + "/ingest/v1/errors"),
               let body = try? JSONEncoder().encode(event) else { return }

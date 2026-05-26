@@ -4,9 +4,12 @@ Official AllStak SDK for Apple platforms (iOS / macOS / tvOS), Swift. Captures
 errors and reports them to AllStak with the data needed for **server-side dSYM
 symbolication**: native instruction addresses + the process's loaded-image UUIDs.
 
-> Status: early (0.1.0). Slice 1 — package, native binary-image/UUID capture,
-> error capture + transport. Crash (signal/NSException) handlers and dSYM upload
-> tooling are on the roadmap.
+> Status: early (0.1.0). Implemented (dependency-free, our own code): package,
+> native binary-image/UUID capture, manual error capture + transport, and
+> **automatic uncaught-`NSException` crash capture** persisted to disk and sent on
+> the next launch (with the crash-time image layout). On the roadmap: async-signal-
+> safe `signal` handlers (the remaining native Swift crashes — needs on-device
+> verification), scope/breadcrumbs, and dSYM upload tooling.
 
 ## Install (Swift Package Manager)
 

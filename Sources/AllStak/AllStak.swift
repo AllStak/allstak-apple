@@ -19,9 +19,16 @@ public enum AllStak {
     public static func start(apiKey: String,
                              host: String = "https://api.allstak.sa",
                              environment: String? = nil,
-                             release: String? = nil) {
-        lock.lock(); defer { lock.unlock() }
-        client = AllStakClient(apiKey: apiKey, host: host, environment: environment, release: release)
+                             release: String? = nil,
+                             enableCrashCapture: Bool = true) {
+        lock.lock()
+        let newClient = AllStakClient(apiKey: apiKey, host: host, environment: environment, release: release)
+        client = newClient
+        lock.unlock()
+
+        if enableCrashCapture {
+            CrashReporter.install(store: CrashStore.defaultStore(), client: newClient)
+        }
     }
 
     /// Capture a Swift `Error`.
