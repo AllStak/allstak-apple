@@ -43,6 +43,42 @@ do { try risky() } catch { AllStak.capture(error) }
 AllStak.capture(message: "checkout failed", level: "warning")
 ```
 
+## Release identifier (automatic)
+
+If you omit `release`, the SDK auto-detects it. Resolution order, highest first:
+
+1. **Explicit** `release:` you pass to `start` — always wins.
+2. **`ALLSTAK_RELEASE`** read from the process environment (build-time override).
+3. **App version** read at runtime from the host app's `Info.plist`
+   (`CFBundleShortVersionString` + `CFBundleVersion`), formatted `1.4.2 (123)`.
+4. **SDK version** as a last resort, so `release` is never empty.
+
+```swift
+// No release passed — auto-detects the app's Info.plist version, e.g. "1.4.2 (123)":
+AllStak.start(apiKey: "astk_live_xxxxxxxx", environment: "production")
+
+// Opt out of all automatic detection (only an explicit release is ever sent):
+AllStak.start(apiKey: "astk_live_xxxxxxxx", release: "1.4.2", autoDetectRelease: false)
+```
+
+**Honest note on git on mobile.** A shipped `.app`/`.ipa` contains no `.git`
+directory and no `git` binary, so there is no runtime git detection in
+production. The genuinely automatic, runtime-available release identifier for a
+mobile app is its own `Info.plist` version — which is what step 3 reads.
+
+**Embedding a git SHA (recommended).** To tie events to a commit, inject the SHA
+at build time and forward it as `ALLSTAK_RELEASE`. For example, in a build phase
+or CI step set it in the app's `Info.plist`/environment, or pass it explicitly:
+
+```sh
+# In CI, before archiving:
+export ALLSTAK_RELEASE="1.4.2+$(git rev-parse --short HEAD)"
+```
+
+Then `AllStak.start(...)` with no `release` picks it up automatically. (We
+deliberately do **not** ship an SPM prebuild plugin to embed the SHA: it would
+add build-graph complexity for a one-line CI export. Keep it in CI.)
+
 ## How native symbolication works
 
 Apple crash frames are raw instruction addresses, not symbols. This SDK sends, per

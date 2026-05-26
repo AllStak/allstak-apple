@@ -15,12 +15,23 @@ public final class AllStakClient: @unchecked Sendable {
     private let release: String?
     private let session: URLSession
 
-    public init(apiKey: String, host: String, environment: String?, release: String?) {
+    /// - Parameters:
+    ///   - release: explicit release; when `nil`/empty and `autoDetectRelease`
+    ///     is `true`, the release is resolved from `ALLSTAK_RELEASE`, then the
+    ///     host app's `Info.plist` version, then the SDK version. See
+    ///     ``ReleaseResolver``.
+    ///   - autoDetectRelease: gates automatic resolution (env / app version /
+    ///     SDK version). Default `true`.
+    public init(apiKey: String, host: String, environment: String?, release: String?,
+                autoDetectRelease: Bool = true) {
         self.apiKey = apiKey
         // Normalize trailing slash so host + path is well-formed.
         self.host = host.hasSuffix("/") ? String(host.dropLast()) : host
         self.environment = environment
-        self.release = release
+        self.release = ReleaseResolver.resolve(
+            explicit: release,
+            autoDetect: autoDetectRelease,
+            sdkVersion: Self.sdkVersion)
         self.session = URLSession(configuration: .ephemeral)
     }
 
