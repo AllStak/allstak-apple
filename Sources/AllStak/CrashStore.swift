@@ -33,6 +33,19 @@ public final class CrashStore: @unchecked Sendable {
         try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
     }
 
+    /// Fixed location of the async-signal-safe signal-crash record (see
+    /// SignalCrashHandler). Pre-opened at install time and written by the handler.
+    public func signalCrashFileURL() -> URL {
+        directory.appendingPathComponent(SignalCrashHandler.recordFilename)
+    }
+
+    /// Read + remove any persisted signal-crash record from a previous launch,
+    /// converted to the shared `CrashReport`. Normal context (the handler itself
+    /// only writes the raw record). Returns nil if there's nothing pending.
+    public func pendingSignalReport() -> CrashReport? {
+        SignalCrashHandler.readPendingReport(crashFileURL: signalCrashFileURL())
+    }
+
     /// Default location: <caches>/com.allstak/crashes
     public static func defaultStore() -> CrashStore {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first

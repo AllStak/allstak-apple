@@ -4,12 +4,18 @@ Official AllStak SDK for Apple platforms (iOS / macOS / tvOS), Swift. Captures
 errors and reports them to AllStak with the data needed for **server-side dSYM
 symbolication**: native instruction addresses + the process's loaded-image UUIDs.
 
-> Status: early (0.1.0). Implemented (dependency-free, our own code): package,
-> native binary-image/UUID capture, manual error capture + transport, and
-> **automatic uncaught-`NSException` crash capture** persisted to disk and sent on
-> the next launch (with the crash-time image layout). On the roadmap: async-signal-
-> safe `signal` handlers (the remaining native Swift crashes — needs on-device
-> verification), scope/breadcrumbs, and dSYM upload tooling.
+> Status: early (0.1.0). Implemented (dependency-free, our own code — only
+> Foundation / Darwin / MachO): package, native binary-image/UUID capture, manual
+> error capture + transport, **automatic uncaught-`NSException` crash capture**, and
+> **async-signal-safe POSIX signal crash capture** (SIGSEGV / SIGABRT / SIGBUS /
+> SIGILL / SIGFPE / SIGTRAP — the dominant class of real Swift crashes: force-unwrap
+> traps, out-of-bounds, bad pointer access). Both channels are persisted to disk and
+> sent on the next launch with the crash-time image layout. The signal handler runs
+> on a pre-allocated alternate stack with a pre-opened crash fd, touches no heap,
+> chains the previous handler, and re-raises so the OS crash report still generates.
+> The record writer and the next-launch reader/parser are unit-tested; the live
+> in-process handler is **pending on-device verification** (a real SIGSEGV can't be
+> raised safely in CI). On the roadmap: scope/breadcrumbs and dSYM upload tooling.
 
 ## Install (Swift Package Manager)
 

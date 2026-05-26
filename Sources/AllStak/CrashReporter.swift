@@ -21,10 +21,16 @@ private func allstakHandleException(_ exception: NSException) {
 
 /// Installs crash capture and flushes crashes from previous launches.
 ///
-/// Slice 1 covers uncaught `NSException`s (Objective-C exceptions, `try!`/
-/// force-unwrap traps that route through NSException). Async-signal-safe `signal`
-/// handlers — which catch the remaining native Swift crashes (SIGSEGV/SIGABRT/…)
-/// — are the next slice; they require on-device verification.
+/// Covers both crash channels on Apple platforms:
+///   * uncaught `NSException`s (Obj-C exceptions) via `NSSetUncaughtExceptionHandler`;
+///   * native POSIX signal crashes (SIGSEGV/SIGABRT/SIGBUS/SIGILL/SIGFPE/SIGTRAP —
+///     force-unwrap traps, out-of-bounds, bad pointer access, etc.) via
+///     async-signal-safe `sigaction` handlers (see SignalCrashHandler).
+///
+/// Signal capture is the dominant path for real Swift crashes; it is implemented
+/// here but the live in-process handler can only be fully validated on-device
+/// (you cannot safely trigger a real SIGSEGV in unit tests). The record writer
+/// and the next-launch reader/parser ARE unit-tested.
 public enum CrashReporter {
 
     /// Send crashes recorded in previous launches, then arm capture for this one.
@@ -37,10 +43,21 @@ public enum CrashReporter {
         g_crashStore = store
         g_previousExceptionHandler = NSGetUncaughtExceptionHandler()
         NSSetUncaughtExceptionHandler(allstakHandleException)
+
+        // Arm async-signal-safe handlers. This pre-allocates the alt-stack, record
+        // buffer, and frame buffer, and pre-opens the crash fd — all done here in
+        // normal context, never inside the handler.
+        SignalCrashHandler.install(crashFileURL: store.signalCrashFileURL())
     }
 
     static func sendPending(store: CrashStore, client: AllStakClient) {
-        let reports = store.pendingReports()
+        var reports = store.pendingReports()
+        // A signal crash from the previous launch is persisted as a raw binary
+        // record by the handler; parse it (normal context) and treat it like any
+        // other pending report.
+        if let signalReport = store.pendingSignalReport() {
+            reports.append(signalReport)
+        }
         guard !reports.isEmpty else { return }
         let images = store.sessionImages()
         for report in reports {
