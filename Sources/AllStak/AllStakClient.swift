@@ -14,6 +14,7 @@ public final class AllStakClient: @unchecked Sendable {
     private let environment: String?
     private let release: String?
     private let session: URLSession
+    private let autoRegisterRelease: Bool
 
     /// - Parameters:
     ///   - release: explicit release; when `nil`/empty and `autoDetectRelease`
@@ -23,7 +24,7 @@ public final class AllStakClient: @unchecked Sendable {
     ///   - autoDetectRelease: gates automatic resolution (env / app version /
     ///     SDK version). Default `true`.
     public init(apiKey: String, host: String, environment: String?, release: String?,
-                autoDetectRelease: Bool = true) {
+                autoDetectRelease: Bool = true, autoRegisterRelease: Bool = true) {
         self.apiKey = apiKey
         // Normalize trailing slash so host + path is well-formed.
         self.host = host.hasSuffix("/") ? String(host.dropLast()) : host
@@ -33,6 +34,8 @@ public final class AllStakClient: @unchecked Sendable {
             autoDetect: autoDetectRelease,
             sdkVersion: Self.sdkVersion)
         self.session = URLSession(configuration: .ephemeral)
+        self.autoRegisterRelease = autoRegisterRelease
+        registerRuntimeRelease()
     }
 
     public func capture(_ error: Error) {
@@ -110,5 +113,29 @@ public final class AllStakClient: @unchecked Sendable {
         req.setValue(apiKey, forHTTPHeaderField: "X-AllStak-Key")
         req.httpBody = body
         session.dataTask(with: req).resume() // fire-and-forget; never block the host app
+    }
+
+    private func registerRuntimeRelease() {
+        guard autoRegisterRelease,
+              !apiKey.isEmpty,
+              let release,
+              !release.isEmpty,
+              ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil,
+              let url = URL(string: host + "/ingest/v1/releases") else { return }
+        let payload: [String: String?] = [
+            "version": release,
+            "environment": environment,
+            "commitSha": ProcessInfo.processInfo.environment["ALLSTAK_COMMIT_SHA"],
+            "branch": ProcessInfo.processInfo.environment["ALLSTAK_BRANCH"],
+            "author": nil,
+            "message": nil
+        ]
+        guard let body = try? JSONEncoder().encode(payload) else { return }
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(apiKey, forHTTPHeaderField: "X-AllStak-Key")
+        req.httpBody = body
+        session.dataTask(with: req).resume()
     }
 }

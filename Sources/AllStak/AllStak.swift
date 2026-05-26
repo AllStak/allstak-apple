@@ -43,10 +43,12 @@ public enum AllStak {
                              environment: String? = nil,
                              release: String? = nil,
                              autoDetectRelease: Bool = true,
+                             autoRegisterRelease: Bool = true,
                              enableCrashCapture: Bool = true) {
         lock.lock()
         let newClient = AllStakClient(apiKey: apiKey, host: host, environment: environment,
-                                      release: release, autoDetectRelease: autoDetectRelease)
+                                      release: release, autoDetectRelease: autoDetectRelease,
+                                      autoRegisterRelease: autoRegisterRelease)
         client = newClient
         lock.unlock()
 
