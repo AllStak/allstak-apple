@@ -31,7 +31,6 @@ import AllStak
 // Once, at launch:
 AllStak.start(
     apiKey: "astk_live_xxxxxxxx",
-    host: "https://api.allstak.sa",
     environment: "production",
     release: "1.4.2"
 )

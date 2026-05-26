@@ -4,7 +4,7 @@ import Foundation
 ///
 /// ```swift
 /// // Explicit release:
-/// AllStak.start(apiKey: "astk_live_...", host: "https://api.allstak.sa",
+/// AllStak.start(apiKey: "astk_live_...",
 ///               environment: "production", release: "1.4.2")
 ///
 /// // Or omit `release` and let the SDK auto-detect it from the app's own
