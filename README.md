@@ -97,3 +97,9 @@ inlined frames). Upload your build's dSYM in CI so events for that release resol
 Event field names match the AllStak ingest API (camelCase). Unknown fields are
 ignored server-side, so `instructionAddr` is forward-compatible while the backend
 ingest contract for native addresses lands.
+
+## Contributing and Support
+
+- Report bugs with the GitHub bug report template: https://github.com/AllStak/allstak-apple/issues/new/choose
+- Open pull requests using the checklist in [CONTRIBUTING.md](CONTRIBUTING.md).
+- Report security vulnerabilities privately through [SECURITY.md](SECURITY.md).
