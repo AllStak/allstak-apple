@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// AllStak Apple SDK (iOS / macOS / tvOS) — public entry point.
 ///
@@ -27,6 +30,7 @@ import Foundation
 public enum AllStak {
 
     nonisolated(unsafe) private static var client: AllStakClient?
+    nonisolated(unsafe) private static var lifecycleObservers: [NSObjectProtocol] = []
     private static let lock = NSLock()
 
     /// Initialize once at app launch.
@@ -38,23 +42,82 @@ public enum AllStak {
     ///     is given, resolve from `ALLSTAK_RELEASE` / the app's `Info.plist`
     ///     version / the SDK version. When `false`, no release is sent unless
     ///     `release` is explicit.
+    /// - Parameter enableAutoSessionTracking: when `true` (default) the SDK opens
+    ///   one release-health session per app launch and ends it on graceful
+    ///   shutdown (app termination / background→terminate). Set `false` to opt
+    ///   out. Session tracking is always fail-open and never blocks launch.
     public static func start(apiKey: String,
                              host: String = "https://api.allstak.sa",
                              environment: String? = nil,
                              release: String? = nil,
                              autoDetectRelease: Bool = true,
                              autoRegisterRelease: Bool = true,
-                             enableCrashCapture: Bool = true) {
+                             enableCrashCapture: Bool = true,
+                             enableAutoSessionTracking: Bool = true) {
         lock.lock()
         let newClient = AllStakClient(apiKey: apiKey, host: host, environment: environment,
                                       release: release, autoDetectRelease: autoDetectRelease,
-                                      autoRegisterRelease: autoRegisterRelease)
+                                      autoRegisterRelease: autoRegisterRelease,
+                                      enableAutoSessionTracking: enableAutoSessionTracking)
         client = newClient
         lock.unlock()
 
+        let store = CrashStore.defaultStore()
+
+        // Reconcile a session left open by a previous launch BEFORE opening this
+        // one: if a marker survived, the prior process did not end gracefully, so
+        // close that session as crashed (or the status a crash handler stamped).
+        reconcilePreviousSession(client: newClient, store: store)
+
         if enableCrashCapture {
-            CrashReporter.install(store: CrashStore.defaultStore(), client: newClient)
+            CrashReporter.install(store: store, client: newClient)
         }
+
+        // Open this launch's session and persist a marker so a crash can be
+        // reconciled next launch. Fully fail-open.
+        if let tracker = newClient.sessionTracker {
+            store.writeOpenSession(OpenSessionMarker(
+                sessionId: tracker.start().id,
+                startedAt: Date().timeIntervalSince1970,
+                status: SessionStatus.ok.wireValue))
+            installLifecycleObservers()
+        }
+    }
+
+    /// End the active session as `crashed` left over from a previous launch.
+    private static func reconcilePreviousSession(client: AllStakClient, store: CrashStore) {
+        guard let marker = store.openSession() else { return }
+        // A surviving marker means the previous process exited without a graceful
+        // end. Treat OK as crashed; otherwise honour the stamped terminal status.
+        let status = marker.status == SessionStatus.ok.wireValue ? "crashed" : marker.status
+        let duration = max(0, Int((Date().timeIntervalSince1970 - marker.startedAt) * 1000))
+        client.endPreviousSession(sessionId: marker.sessionId, durationMs: duration, status: status)
+        store.clearOpenSession()
+    }
+
+    /// Observe app-lifecycle teardown so the session is ended gracefully. UIKit
+    /// only; on non-UIKit platforms the next-launch reconciliation is the safety
+    /// net. Best-effort and idempotent.
+    private static func installLifecycleObservers() {
+        #if canImport(UIKit)
+        let nc = NotificationCenter.default
+        let end: (Notification) -> Void = { _ in endSessionGracefully() }
+        var observers: [NSObjectProtocol] = []
+        observers.append(nc.addObserver(forName: UIApplication.willTerminateNotification,
+                                        object: nil, queue: nil, using: end))
+        observers.append(nc.addObserver(forName: UIApplication.didEnterBackgroundNotification,
+                                        object: nil, queue: nil, using: end))
+        lock.lock(); lifecycleObservers = observers; lock.unlock()
+        #endif
+    }
+
+    /// End the current session gracefully (clears the crash marker first so it is
+    /// NOT reconciled as crashed next launch). Idempotent via the tracker.
+    private static func endSessionGracefully() {
+        lock.lock(); let c = client; lock.unlock()
+        guard let c else { return }
+        CrashStore.defaultStore().clearOpenSession()
+        c.endSession()
     }
 
     /// Capture a Swift `Error`.

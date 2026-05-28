@@ -26,6 +26,10 @@ public struct AllStakErrorEvent: Codable, Sendable {
     public let platform: String        // "cocoa"
     public let environment: String?
     public let release: String?
+    /// Release-health session this event belongs to. The backend's error
+    /// consumer marks the session errored/crashed from this id. `nil` when
+    /// session tracking is disabled.
+    public let sessionId: String?
     public let frames: [AllStakFrame]
     public let debugMeta: AllStakDebugMeta
     public let sdkName: String

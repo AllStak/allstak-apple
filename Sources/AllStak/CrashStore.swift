@@ -18,6 +18,25 @@ public struct CrashReport: Codable, Sendable, Equatable {
     }
 }
 
+/// The persisted "open session" marker. Written when a release-health session
+/// starts and removed on graceful end; if a launch finds one left over, the
+/// previous process died without ending its session and the prior session is
+/// ended as `crashed` (or whatever terminal status the crash handler stamped).
+public struct OpenSessionMarker: Codable, Sendable, Equatable {
+    public let sessionId: String
+    public let startedAt: Double   // seconds since epoch
+    /// Terminal status a crash handler stamped before the process died. When the
+    /// process exits cleanly the marker is removed first, so a marker that
+    /// survives to the next launch implies an abnormal/crashed end.
+    public let status: String      // SessionStatus wire value
+
+    public init(sessionId: String, startedAt: Double, status: String) {
+        self.sessionId = sessionId
+        self.startedAt = startedAt
+        self.status = status
+    }
+}
+
 /// On-disk store for crash reports + the per-launch binary-image layout (so a
 /// crash captured in a previous launch is symbolicated against THAT launch's
 /// ASLR-slid image addresses, not the new launch's).
@@ -25,11 +44,13 @@ public final class CrashStore: @unchecked Sendable {
 
     private let directory: URL
     private let imagesURL: URL
+    private let openSessionURL: URL
     private let fileManager = FileManager.default
 
     public init(directory: URL) {
         self.directory = directory
         self.imagesURL = directory.appendingPathComponent("images.json")
+        self.openSessionURL = directory.appendingPathComponent("open-session.json")
         try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
     }
 
@@ -87,5 +108,39 @@ public final class CrashStore: @unchecked Sendable {
             return []
         }
         return images
+    }
+
+    // MARK: - Open-session marker (crash-aware session lifecycle)
+
+    /// Persist the currently-open session so a crash that prevents a graceful
+    /// `/sessions/end` can still be reconciled on the next launch.
+    public func writeOpenSession(_ marker: OpenSessionMarker) {
+        if let data = try? JSONEncoder().encode(marker) {
+            try? data.write(to: openSessionURL, options: .atomic)
+        }
+    }
+
+    /// Read the open-session marker left by a previous launch, if any.
+    public func openSession() -> OpenSessionMarker? {
+        guard let data = try? Data(contentsOf: openSessionURL),
+              let marker = try? JSONDecoder().decode(OpenSessionMarker.self, from: data) else {
+            return nil
+        }
+        return marker
+    }
+
+    /// Bump the persisted open-session marker's status (e.g. to `crashed`) so the
+    /// next launch ends the prior session with the right terminal status. Best-
+    /// effort; never throws. A no-op if no marker is present.
+    public func markOpenSession(status: String) {
+        guard let current = openSession() else { return }
+        writeOpenSession(OpenSessionMarker(sessionId: current.sessionId,
+                                           startedAt: current.startedAt,
+                                           status: status))
+    }
+
+    /// Remove the open-session marker on graceful session end.
+    public func clearOpenSession() {
+        try? fileManager.removeItem(at: openSessionURL)
     }
 }

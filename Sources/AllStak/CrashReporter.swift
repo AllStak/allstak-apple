@@ -14,6 +14,9 @@ private func allstakHandleException(_ exception: NSException) {
             addresses: exception.callStackReturnAddresses.map { $0.uintValue },
             timestamp: Date().timeIntervalSince1970)
         try? store.write(report)
+        // Stamp the open release-health session as crashed so the next launch
+        // ends it with the right terminal status. Best-effort; never throws.
+        store.markOpenSession(status: "crashed")
     }
     // Chain any previously-installed handler so we don't swallow other reporters.
     g_previousExceptionHandler?(exception)
