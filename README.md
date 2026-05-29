@@ -4,27 +4,73 @@ Official AllStak SDK for Apple platforms (iOS / macOS / tvOS), Swift. Captures
 errors and reports them to AllStak with the data needed for **server-side dSYM
 symbolication**: native instruction addresses + the process's loaded-image UUIDs.
 
-> Status: early (0.1.0). Implemented (dependency-free, our own code — only
-> Foundation / Darwin / MachO): package, native binary-image/UUID capture, manual
-> error capture + transport, **automatic uncaught-`NSException` crash capture**, and
-> **async-signal-safe POSIX signal crash capture** (SIGSEGV / SIGABRT / SIGBUS /
-> SIGILL / SIGFPE / SIGTRAP — the dominant class of real Swift crashes: force-unwrap
-> traps, out-of-bounds, bad pointer access). Both channels are persisted to disk and
-> sent on the next launch with the crash-time image layout. The signal handler runs
-> on a pre-allocated alternate stack with a pre-opened crash fd, touches no heap,
-> chains the previous handler, and re-raises so the OS crash report still generates.
-> The record writer and the next-launch reader/parser are unit-tested; the live
-> in-process handler is **pending on-device verification** (a real SIGSEGV can't be
-> raised safely in CI). Build-time **dSYM upload tooling** for server-side
-> symbolication ships in [`Scripts/`](Scripts/allstak-upload-dsyms.sh) (see
-> [Uploading dSYMs](#uploading-dsyms-server-side-symbolication)). On the roadmap:
-> scope/breadcrumbs.
+> Status: early (0.1.0), dependency-free (Foundation / Darwin / MachO only — no
+> third-party pods). Installable via Swift Package Manager **or** CocoaPods (see
+> [Install](#install)). The full, current feature set is below.
 
-## Install (Swift Package Manager)
+## Features
+
+What the SDK supports today (all our own code, Foundation-only):
+
+- **Crash & error capture**
+  - Automatic uncaught-`NSException` capture.
+  - Async-signal-safe **POSIX signal** crash capture (SIGSEGV / SIGABRT /
+    SIGBUS / SIGILL / SIGFPE / SIGTRAP — the dominant class of real Swift
+    crashes: force-unwrap traps, out-of-bounds, bad pointer access). The handler
+    runs on a pre-allocated alternate stack with a pre-opened crash fd, touches
+    no heap, chains the previous handler, and re-raises so the OS crash report
+    still generates.
+  - Both channels are persisted to disk and sent on the **next launch** with the
+    crash-time loaded-image layout.
+  - Manual `AllStak.capture(error)` / `AllStak.capture(message:level:)`.
+- **Scope** — Sentry-style breadcrumbs, `user`, `tags`, `contexts`, and `extra`,
+  merged onto every event.
+- **Release health** — automatic session tracking (start/end + crash-free
+  sessions/users), with the resolved release stamped on every event/session.
+- **Privacy** — PII scrubbing at the wire chokepoint, a `beforeSend` hook to
+  edit/drop events, and a `sendDefaultPii` opt-in for default-redacted fields.
+- **Reliable transport** — offline persistence (an on-disk envelope spool) plus
+  retry with exponential backoff and `Retry-After` honoring, so events survive
+  flaky networks and process restarts.
+- **Outbound HTTP instrumentation** — automatic `URLSession` breadcrumbs
+  (method, query-stripped URL, status, duration, size) with W3C
+  `traceparent` + `baggage` propagation; the ingest host is always skipped.
+- **Automatic release detection** — explicit → `ALLSTAK_RELEASE` env → app
+  `Info.plist` version → SDK version (never empty).
+- **Native symbolication support** — sends instruction addresses +
+  `debugMeta.images` (`LC_UUID`s) for server-side dSYM resolution, plus a
+  build-time **dSYM upload script** for CI.
+
+### Parity with sentry-cocoa (honest status)
+
+Implemented above. **Still on the roadmap** (not yet in this SDK):
+
+- **App-hang / ANR** detection (main-thread watchdog).
+- **OOM / watchdog-termination** heuristics and **MetricKit** ingestion.
+- **On-device E2E verification of the live signal handler.** The crash-record
+  writer and the next-launch reader/parser are unit-tested; raising a real
+  SIGSEGV in-process can't be done safely in CI, so the live handler still needs
+  device verification.
+- Performance tracing / spans, profiling, view/UI auto-instrumentation, attachments,
+  and screenshots are out of scope for now.
+
+## Install
+
+### Swift Package Manager
 
 ```swift
 .package(url: "https://github.com/AllStak/allstak-apple.git", from: "0.1.0")
 ```
+
+### CocoaPods
+
+```ruby
+pod 'AllStak', '~> 0.1'
+```
+
+> The CocoaPods `spec.version` and the runtime `AllStakClient.sdkVersion`
+> constant are a **single source of truth** — they are bumped together on every
+> release, and `AllStakVersionParityTests` fails the build if they drift.
 
 ## Usage
 
