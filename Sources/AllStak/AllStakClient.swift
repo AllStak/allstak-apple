@@ -56,6 +56,20 @@ public final class AllStakClient: @unchecked Sendable {
     /// off (or under XCTest), in which case no session id is stamped on events.
     let sessionTracker: SessionTracker?
 
+    /// Live app-hang (ANR) watchdog. `nil` until armed by ``AllStak/start`` and
+    /// only when `enableAppHangTracking` is on. Holds a strong ref so the timer
+    /// stays alive for the client's lifetime.
+    nonisolated(unsafe) var appHangDetector: AppHangDetector?
+
+    /// Watchdog / OOM termination tracker. `nil` until armed by ``AllStak/start``
+    /// and only when `enableWatchdogTerminationTracking` is on.
+    nonisolated(unsafe) var watchdogTracker: WatchdogTerminationTracker?
+
+    /// MetricKit subscriber, retained so the `MXMetricManager` subscription stays
+    /// alive. Stored as `AnyObject?` because the concrete type is availability-
+    /// and `canImport`-gated; `nil` where MetricKit is unavailable / disabled.
+    nonisolated(unsafe) var metricKitSubscriber: AnyObject?
+
     /// Per-process distributed-trace id (32 hex). One trace per app launch — every
     /// auto-instrumented outbound request becomes a child span of this head-of-
     /// trace, exactly like the JS SDK's sticky head-of-trace. Lazily stable for the
@@ -331,6 +345,85 @@ public final class AllStakClient: @unchecked Sendable {
         send(buildCrashEvent(report, images: images))
     }
 
+    // MARK: - App-hang / watchdog-termination capture
+
+    /// Record an app-hang (ANR) event: a synthetic `App Hanging` exception at
+    /// `warning` level carrying the (best-effort) main-thread stack and the
+    /// `app_hang` mechanism. Also marks the release-health session errored, like
+    /// any handled error. Routed through the same scrub + transport chokepoint.
+    /// Fully fail-open.
+    func captureAppHang(duration: TimeInterval, stack: [String]) {
+        sessionTracker?.recordError()
+        let ms = Int((duration * 1000).rounded())
+        let event = buildSyntheticEvent(
+            exceptionClass: "App Hanging",
+            message: "The main thread was unresponsive for \(ms) ms",
+            level: "warning",
+            mechanism: "app_hang",
+            symbolFrames: stack)
+        send(event)
+    }
+
+    /// Report a watchdog / OOM termination inferred from the PREVIOUS launch. A
+    /// synthetic `Watchdog Termination` event at `error` level with the
+    /// `watchdog_termination` mechanism, timestamped to the prior run's start. No
+    /// reliable stack exists (the OS killed us), so frames are empty. Fail-open.
+    func captureWatchdogTermination(_ marker: AppRunStateMarker) {
+        var event = buildSyntheticEvent(
+            exceptionClass: "Watchdog Termination",
+            message: "The app was terminated by the OS watchdog (likely out-of-memory or unresponsive) while in the foreground",
+            level: "error",
+            mechanism: WatchdogTerminationTracker.mechanism,
+            symbolFrames: [])
+        event.timestamp = marker.startedAt
+        send(event)
+    }
+
+    /// Feed a MetricKit diagnostic (crash / hang) into the pipeline. The
+    /// system-symbolicated call-stack JSON, when present, rides in `extra` under
+    /// `metric_kit_call_stack`. Fail-open.
+    func captureMetricKitDiagnostic(mechanism: String, title: String, callStackJSON: String?) {
+        var event = buildSyntheticEvent(
+            exceptionClass: title,
+            message: title,
+            level: mechanism == MetricKitMechanism.crash ? "fatal" : "warning",
+            mechanism: mechanism,
+            symbolFrames: [])
+        if let callStackJSON {
+            var extra = event.extra ?? [:]
+            extra["metric_kit_call_stack"] = .string(callStackJSON)
+            event.extra = extra
+        }
+        send(event)
+    }
+
+    /// Build a synthetic event (app-hang / watchdog / MetricKit) carrying a
+    /// distinct `mechanism`, an explicit level, and pre-resolved symbol strings as
+    /// frames (`function` carries the symbol; no instruction address). Attaches
+    /// the global scope, like a crash. Visible for testing.
+    func buildSyntheticEvent(exceptionClass: String, message: String, level: String,
+                             mechanism: String, symbolFrames: [String]) -> AllStakErrorEvent {
+        let frames = symbolFrames.prefix(Self.maxFrames).map { symbol in
+            AllStakFrame(function: symbol, filename: nil, instructionAddr: nil, inApp: true)
+        }
+        var event = AllStakErrorEvent(
+            exceptionClass: exceptionClass,
+            message: message,
+            level: level,
+            platform: "cocoa",
+            environment: environment,
+            release: release,
+            sessionId: sessionTracker?.currentSessionId,
+            frames: Array(frames),
+            debugMeta: AllStakDebugMeta(images: BinaryImageProvider.current()),
+            sdkName: Self.sdkName,
+            sdkVersion: Self.sdkVersion,
+            timestamp: Date().timeIntervalSince1970,
+            mechanism: mechanism)
+        attachScope(scope.snapshot(), to: &event)
+        return event
+    }
+
     /// Flush a crash report recorded on a PREVIOUS launch through the reliable
     /// transport, invoking `onResolved` once the delivery settles. The crash event
     /// is built + scrubbed here and the resulting bytes are delivered with full
@@ -418,6 +511,46 @@ public final class AllStakClient: @unchecked Sendable {
                     sessionId: sessionProvider(),
                     sampled: true)
             })
+    }
+
+    /// Arm the live app-hang watchdog with the configured threshold. Each hang
+    /// edge routes through ``captureAppHang(duration:stack:)``; recovery is a
+    /// no-op breadcrumb (the event already records the hang). Suppressed under
+    /// XCTest so a unit test never spins a real timer. Fail-open.
+    func installAppHangDetector(timeoutInterval: TimeInterval) {
+        guard !Self.isRunningUnderTests else { return }
+        let detector = AppHangDetector(
+            timeoutInterval: timeoutInterval,
+            onHang: { [weak self] duration, stack in
+                self?.captureAppHang(duration: duration, stack: stack)
+            },
+            onResolved: { [weak self] in
+                self?.addBreadcrumb(type: "debug", message: "App hang resolved",
+                                    category: "app.hang", level: "info", data: nil)
+            })
+        self.appHangDetector = detector
+        detector.start()
+    }
+
+    /// Arm watchdog / OOM termination tracking: reconcile the previous launch's
+    /// run-state marker (reporting a termination if inferred), then write this
+    /// launch's marker. `crashRecorded` is whether a crash flush found anything.
+    /// Suppressed under XCTest. Fail-open.
+    @discardableResult
+    func installWatchdogTracking(store: CrashStore, crashRecorded: Bool) -> WatchdogTerminationTracker? {
+        guard !Self.isRunningUnderTests else { return nil }
+        let tracker = WatchdogTerminationTracker(
+            store: store,
+            release: release,
+            osVersion: Platform.osVersion(),
+            reporter: { [weak self] marker in
+                self?.captureWatchdogTermination(marker)
+            })
+        tracker.reconcileAndArm(crashRecorded: crashRecorded,
+                                isForeground: Platform.isForeground(),
+                                isDebugging: Platform.isDebuggerAttached())
+        self.watchdogTracker = tracker
+        return tracker
     }
 
     private func registerRuntimeRelease() {

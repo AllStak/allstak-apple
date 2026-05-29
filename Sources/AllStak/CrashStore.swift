@@ -37,6 +37,41 @@ public struct OpenSessionMarker: Codable, Sendable, Equatable {
     }
 }
 
+/// Persisted run-state marker, written on launch and cleared on a clean exit /
+/// background / when a crash is recorded. If a launch finds one still present
+/// AND no crash was recorded AND the prior run was in the foreground, the prior
+/// process was killed by the OS without a chance to run our handlers — a
+/// watchdog / out-of-memory termination — and is reported on this launch with a
+/// distinct `"watchdog_termination"` mechanism. Mirrors sentry-cocoa's
+/// `SentryAppStateManager` / `SentryWatchdogTerminationLogic`.
+public struct AppRunStateMarker: Codable, Sendable, Equatable {
+    /// Resolved release at the time the marker was written. A different release
+    /// on the next launch implies an app *update* between runs, which is NOT a
+    /// watchdog termination (Sentry parity) — avoids a false positive.
+    public let release: String?
+    /// OS version when the marker was written. A different OS version implies an
+    /// OS update between runs — also not a watchdog termination.
+    public let osVersion: String?
+    /// `true` when the app was in the foreground (active or inactive but not
+    /// backgrounded) at the last update of this marker. Background terminations
+    /// are normal OS behaviour and must NOT be reported as watchdog kills.
+    public let isForeground: Bool
+    /// `true` when a debugger was attached — a paused/stopped debugger looks like
+    /// a hang/termination, so debugger runs are never reported.
+    public let isDebugging: Bool
+    /// When the marker was written (seconds since epoch).
+    public let startedAt: Double
+
+    public init(release: String?, osVersion: String?, isForeground: Bool,
+                isDebugging: Bool, startedAt: Double) {
+        self.release = release
+        self.osVersion = osVersion
+        self.isForeground = isForeground
+        self.isDebugging = isDebugging
+        self.startedAt = startedAt
+    }
+}
+
 /// On-disk store for crash reports + the per-launch binary-image layout (so a
 /// crash captured in a previous launch is symbolicated against THAT launch's
 /// ASLR-slid image addresses, not the new launch's).
@@ -45,12 +80,14 @@ public final class CrashStore: @unchecked Sendable {
     private let directory: URL
     private let imagesURL: URL
     private let openSessionURL: URL
+    private let runStateURL: URL
     private let fileManager = FileManager.default
 
     public init(directory: URL) {
         self.directory = directory
         self.imagesURL = directory.appendingPathComponent("images.json")
         self.openSessionURL = directory.appendingPathComponent("open-session.json")
+        self.runStateURL = directory.appendingPathComponent("run-state.json")
         try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
     }
 
@@ -173,5 +210,34 @@ public final class CrashStore: @unchecked Sendable {
     /// Remove the open-session marker on graceful session end.
     public func clearOpenSession() {
         try? fileManager.removeItem(at: openSessionURL)
+    }
+
+    // MARK: - App run-state marker (watchdog / OOM termination inference)
+
+    /// Persist the current launch's run-state so a watchdog / OOM termination —
+    /// which gives our crash handlers no chance to run — can be inferred on the
+    /// next launch. Written on launch and updated on foreground/background
+    /// transitions; cleared on a clean exit, on entering background, and when a
+    /// crash is recorded. Best-effort; never throws.
+    public func writeRunState(_ marker: AppRunStateMarker) {
+        if let data = try? JSONEncoder().encode(marker) {
+            try? data.write(to: runStateURL, options: .atomic)
+        }
+    }
+
+    /// Read the run-state marker left by a previous launch, if any.
+    public func runState() -> AppRunStateMarker? {
+        guard let data = try? Data(contentsOf: runStateURL),
+              let marker = try? JSONDecoder().decode(AppRunStateMarker.self, from: data) else {
+            return nil
+        }
+        return marker
+    }
+
+    /// Remove the run-state marker — on a clean termination, on entering
+    /// background, or when a crash is recorded (so the crash, not a phantom
+    /// watchdog termination, is the reported cause). Best-effort; never throws.
+    public func clearRunState() {
+        try? fileManager.removeItem(at: runStateURL)
     }
 }

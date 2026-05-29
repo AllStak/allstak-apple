@@ -39,7 +39,18 @@ public struct AllStakErrorEvent: Codable, Sendable {
     public let debugMeta: AllStakDebugMeta
     public let sdkName: String
     public let sdkVersion: String
-    public let timestamp: Double
+    /// Event time, seconds since epoch. Mutable so a synthetic event (e.g. a
+    /// watchdog termination inferred on the next launch) can be stamped to the
+    /// time the originating run actually died, not the time we report it.
+    public var timestamp: Double
+
+    /// Distinguishes how the event was produced when it is NOT an ordinary
+    /// handled error / crash — e.g. `"app_hang"` (main-thread unresponsive) or
+    /// `"watchdog_termination"` (inferred OOM / watchdog kill on the prior
+    /// launch). `nil` for ordinary errors and crashes (the common case), so the
+    /// field is omitted from the JSON and the existing wire shape is preserved.
+    /// The backend treats it as a forward-compatible optional discriminator.
+    public var mechanism: String?
 
     // ── Scope (additive, optional; omitted from JSON when empty) ───────────
     public var breadcrumbs: [AllStakBreadcrumb]?
@@ -54,6 +65,7 @@ public struct AllStakErrorEvent: Codable, Sendable {
                 environment: String?, release: String?, sessionId: String?,
                 frames: [AllStakFrame], debugMeta: AllStakDebugMeta,
                 sdkName: String, sdkVersion: String, timestamp: Double,
+                mechanism: String? = nil,
                 breadcrumbs: [AllStakBreadcrumb]? = nil, user: AllStakUser? = nil,
                 tags: [String: String]? = nil,
                 contexts: [String: [String: JSONValue]]? = nil,
@@ -70,6 +82,7 @@ public struct AllStakErrorEvent: Codable, Sendable {
         self.sdkName = sdkName
         self.sdkVersion = sdkVersion
         self.timestamp = timestamp
+        self.mechanism = mechanism
         self.breadcrumbs = breadcrumbs
         self.user = user
         self.tags = tags
@@ -81,6 +94,7 @@ public struct AllStakErrorEvent: Codable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case exceptionClass, message, level, platform, environment, release
         case sessionId, frames, debugMeta, sdkName, sdkVersion, timestamp
+        case mechanism
         case breadcrumbs, user, tags, contexts, fingerprint
         // `extra` rides on the backend's `metadata` field.
         case extra = "metadata"
@@ -100,6 +114,9 @@ public struct AllStakErrorEvent: Codable, Sendable {
         try c.encode(sdkName, forKey: .sdkName)
         try c.encode(sdkVersion, forKey: .sdkVersion)
         try c.encode(timestamp, forKey: .timestamp)
+        // Omit `mechanism` for ordinary errors/crashes so the existing wire shape
+        // is byte-for-byte unchanged; present only for app-hang / watchdog events.
+        try c.encodeIfPresent(mechanism, forKey: .mechanism)
 
         // Omit scope fields entirely when empty so the existing wire shape is
         // preserved for events that carry no scope.

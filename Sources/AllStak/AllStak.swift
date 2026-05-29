@@ -64,6 +64,25 @@ public enum AllStak {
     ///   chokepoint, BEFORE PII scrubbing. Return `nil` to drop the event, or a
     ///   (possibly mutated) event to send. The hook sees real, un-scrubbed data;
     ///   the wire payload is always scrubbed afterwards.
+    /// - Parameter enableAppHangTracking: when `true` (default) a background
+    ///   watchdog pings the main run loop and records an `App Hanging` warning
+    ///   event (`app_hang` mechanism) if the main thread is unresponsive for
+    ///   longer than ``appHangTimeoutInterval``; the hang resolves when the main
+    ///   thread recovers. Fully fail-open; never freezes the host. A no-op on
+    ///   headless platforms and under XCTest.
+    /// - Parameter appHangTimeoutInterval: the unresponsiveness threshold in
+    ///   seconds before an app hang is reported. Default `2.0` (Sentry parity).
+    /// - Parameter enableWatchdogTerminationTracking: when `true` (default) the
+    ///   SDK persists a run-state marker each launch and, on the NEXT launch,
+    ///   infers a watchdog / OOM termination (`watchdog_termination` mechanism) if
+    ///   the marker survived AND no crash was recorded AND the prior run was in
+    ///   the foreground (and no app/OS update or debugger). Avoids false
+    ///   positives. Fully fail-open.
+    /// - Parameter enableMetricKit: when `true` (default) and MetricKit is
+    ///   available (iOS 14+/macOS 12+), the SDK subscribes to `MXMetricManager`
+    ///   and feeds post-hoc `MXCrashDiagnostic` / `MXHangDiagnostic` payloads into
+    ///   the same pipeline. Entirely guarded by `canImport(MetricKit)` and
+    ///   fail-open. A no-op under XCTest and on platforms without MetricKit.
     public static func start(apiKey: String,
                              host: String = "https://api.allstak.sa",
                              environment: String? = nil,
@@ -73,6 +92,10 @@ public enum AllStak {
                              enableCrashCapture: Bool = true,
                              enableAutoSessionTracking: Bool = true,
                              enableAutoHttpInstrumentation: Bool = true,
+                             enableAppHangTracking: Bool = true,
+                             appHangTimeoutInterval: TimeInterval = 2.0,
+                             enableWatchdogTerminationTracking: Bool = true,
+                             enableMetricKit: Bool = true,
                              sendDefaultPii: Bool = false,
                              beforeSend: (@Sendable (AllStakErrorEvent) -> AllStakErrorEvent?)? = nil) {
         lock.lock()
@@ -92,8 +115,25 @@ public enum AllStak {
         // close that session as crashed (or the status a crash handler stamped).
         reconcilePreviousSession(client: newClient, store: store)
 
+        // Whether the previous launch left a crash report behind, captured BEFORE
+        // crash capture clears/flushes anything, so watchdog inference does not
+        // mistake a real crash for an OOM kill.
+        let priorCrashRecorded = store.openSession()?.status == SessionStatus.crashed.wireValue
+            || !store.pendingReports().isEmpty
+            || store.peekSignalReport() != nil
+
         if enableCrashCapture {
             CrashReporter.install(store: store, client: newClient)
+        }
+
+        // Watchdog / OOM termination tracking: reconcile the previous launch's
+        // run-state marker (reporting a termination if inferred) and arm this
+        // launch's marker. Done AFTER crash capture so `priorCrashRecorded`
+        // reflects the prior launch, not this one. Fully fail-open.
+        if enableWatchdogTerminationTracking {
+            newClient.installWatchdogTracking(store: store, crashRecorded: priorCrashRecorded)
+        } else {
+            store.clearRunState()
         }
 
         // Open this launch's session and persist a marker so a crash can be
@@ -103,7 +143,23 @@ public enum AllStak {
                 sessionId: tracker.start().id,
                 startedAt: Date().timeIntervalSince1970,
                 status: SessionStatus.ok.wireValue))
+        }
+
+        // Lifecycle observers update the session AND the run-state marker on
+        // background/terminate. Installed whenever either feature needs them.
+        if newClient.sessionTracker != nil || enableWatchdogTerminationTracking {
             installLifecycleObservers()
+        }
+
+        // App-hang (ANR) watchdog. Fail-open; never freezes the host.
+        if enableAppHangTracking {
+            newClient.installAppHangDetector(timeoutInterval: appHangTimeoutInterval)
+        }
+
+        // MetricKit post-hoc diagnostics. Guarded by canImport + availability +
+        // the flag; entirely fail-open.
+        if enableMetricKit {
+            installMetricKitSubscriber(client: newClient)
         }
 
         // Install automatic outbound HTTP instrumentation (breadcrumbs + W3C trace
@@ -126,29 +182,63 @@ public enum AllStak {
         store.clearOpenSession()
     }
 
-    /// Observe app-lifecycle teardown so the session is ended gracefully. UIKit
-    /// only; on non-UIKit platforms the next-launch reconciliation is the safety
-    /// net. Best-effort and idempotent.
+    /// Observe app-lifecycle transitions so the session is ended gracefully AND
+    /// the watchdog run-state marker tracks foreground/background. UIKit only; on
+    /// non-UIKit platforms the next-launch reconciliation is the safety net.
+    /// Best-effort and idempotent.
     private static func installLifecycleObservers() {
         #if canImport(UIKit)
         let nc = NotificationCenter.default
         let end: (Notification) -> Void = { _ in endSessionGracefully() }
+        let foreground: (Notification) -> Void = { _ in updateForegroundState(true) }
         var observers: [NSObjectProtocol] = []
         observers.append(nc.addObserver(forName: UIApplication.willTerminateNotification,
                                         object: nil, queue: nil, using: end))
         observers.append(nc.addObserver(forName: UIApplication.didEnterBackgroundNotification,
                                         object: nil, queue: nil, using: end))
+        // Returning to foreground re-arms the run-state marker (a background exit
+        // cleared it). Detecting a hang at this point is also desirable.
+        observers.append(nc.addObserver(forName: UIApplication.didBecomeActiveNotification,
+                                        object: nil, queue: nil, using: foreground))
         lock.lock(); lifecycleObservers = observers; lock.unlock()
         #endif
     }
 
     /// End the current session gracefully (clears the crash marker first so it is
-    /// NOT reconciled as crashed next launch). Idempotent via the tracker.
+    /// NOT reconciled as crashed next launch) AND clear the watchdog run-state
+    /// marker (a clean background/terminate is not a watchdog kill). Idempotent.
     private static func endSessionGracefully() {
         lock.lock(); let c = client; lock.unlock()
         guard let c else { return }
         CrashStore.defaultStore().clearOpenSession()
+        // Entering background / terminating is an explained exit → drop the
+        // run-state marker so the next launch does not infer a watchdog kill.
+        c.watchdogTracker?.updateForeground(false, isDebugging: false)
         c.endSession()
+    }
+
+    /// Re-arm the watchdog run-state marker when the app returns to the
+    /// foreground. Best-effort; no-op when watchdog tracking is off.
+    private static func updateForegroundState(_ foreground: Bool) {
+        lock.lock(); let c = client; lock.unlock()
+        c?.watchdogTracker?.updateForeground(foreground,
+                                             isDebugging: Platform.isDebuggerAttached())
+    }
+
+    /// Subscribe to MetricKit and route diagnostics into the pipeline. Guarded by
+    /// `canImport(MetricKit)` + availability + XCTest; fully fail-open. A no-op
+    /// where MetricKit is unavailable. The subscriber is retained on the client.
+    private static func installMetricKitSubscriber(client: AllStakClient) {
+        guard !AllStakClient.isRunningUnderTests else { return }
+        #if canImport(MetricKit) && !os(tvOS)
+        if #available(iOS 14.0, macOS 12.0, *) {
+            let subscriber = MetricKitSubscriber(sink: { [weak client] mechanism, title, json in
+                client?.captureMetricKitDiagnostic(mechanism: mechanism, title: title, callStackJSON: json)
+            })
+            subscriber.subscribe()
+            client.metricKitSubscriber = subscriber
+        }
+        #endif
     }
 
     /// Capture a Swift `Error`.
