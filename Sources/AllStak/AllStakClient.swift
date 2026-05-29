@@ -34,6 +34,10 @@ public final class AllStakClient: @unchecked Sendable {
     /// off (or under XCTest), in which case no session id is stamped on events.
     let sessionTracker: SessionTracker?
 
+    /// The global scope shared across this client. Breadcrumbs / user / tags /
+    /// contexts / extra accumulated here are attached to every captured event.
+    let scope = Scope()
+
     /// - Parameters:
     ///   - release: explicit release; when `nil`/empty and `autoDetectRelease`
     ///     is `true`, the release is resolved from `ALLSTAK_RELEASE`, then the
@@ -86,25 +90,91 @@ public final class AllStakClient: @unchecked Sendable {
         registerRuntimeRelease()
     }
 
-    public func capture(_ error: Error) {
+    public func capture(_ error: Error, scope: Scope? = nil) {
         // Handled error → mark the release-health session errored.
         sessionTracker?.recordError()
         let addresses = Thread.callStackReturnAddresses.map { $0.uintValue }
+        // `scope` nil → buildEvent falls back to the active withScope override,
+        // then the global scope.
         send(buildEvent(
             exceptionClass: String(reflecting: type(of: error)),
             message: String(describing: error),
             level: "error",
-            addresses: addresses))
+            addresses: addresses,
+            scope: scope))
     }
 
-    public func capture(message: String, level: String = "info") {
+    public func capture(message: String, level: String = "info", scope: Scope? = nil) {
         // Only error-or-higher messages escalate the session status, matching
         // the reference model (info/debug logs keep the session OK).
         if level == "error" || level == "fatal" {
             sessionTracker?.recordError()
         }
         let addresses = Thread.callStackReturnAddresses.map { $0.uintValue }
-        send(buildEvent(exceptionClass: "Message", message: message, level: level, addresses: addresses))
+        send(buildEvent(exceptionClass: "Message", message: message, level: level,
+                        addresses: addresses, scope: scope))
+    }
+
+    // MARK: - Scope API (global scope)
+    //
+    // Thin delegations to the global ``scope``; the validation / locking lives
+    // there. Kept on the client so ``AllStak`` can route through the live client.
+
+    func addBreadcrumb(type: String, message: String?, category: String? = nil,
+                       level: String? = nil, data: [String: Any]? = nil) {
+        scope.addBreadcrumb(type: type, message: message, category: category,
+                            level: level, data: data)
+    }
+
+    func setUser(id: String? = nil, email: String? = nil, ip: String? = nil, username: String? = nil) {
+        scope.setUser(id: id, email: email, ip: ip, username: username)
+    }
+
+    func clearUser() { scope.clearUser() }
+
+    func setTag(_ key: String, _ value: String) { scope.setTag(key, value) }
+    func removeTag(_ key: String) { scope.removeTag(key) }
+    func setTags(_ tags: [String: String]) { scope.setTags(tags) }
+
+    func setContext(_ key: String, _ value: [String: Any]?) {
+        scope.setContext(key, value: value)
+    }
+
+    func setExtra(_ key: String, _ value: Any?) {
+        scope.setExtra(key: key, value: value)
+    }
+
+    func setExtras(_ extras: [String: Any]) {
+        scope.setExtras(extras)
+    }
+
+    /// Mutate the global scope inline.
+    func configureScope(_ block: (Scope) -> Void) { block(scope) }
+
+    /// Thread-local stack of active override scopes pushed by `withScope`. Using
+    /// a thread-local keeps concurrent `withScope` calls on different threads
+    /// isolated and lets `capture(...)` discover the innermost active scope
+    /// without threading it through every call. Nesting layers (innermost wins).
+    private static let activeScopeStackKey = "com.allstak.activeScopeStack"
+
+    private static var activeScopeStack: [Scope] {
+        get { (Thread.current.threadDictionary[activeScopeStackKey] as? [Scope]) ?? [] }
+        set { Thread.current.threadDictionary[activeScopeStackKey] = newValue }
+    }
+
+    /// The innermost `withScope` override active on this thread, if any.
+    var activeOverrideScope: Scope? { Self.activeScopeStack.last }
+
+    /// Run `body` with a temporary scope cloned from the global scope; any
+    /// `capture(...)` made inside the body (on this thread) uses that clone, and
+    /// the clone's mutations never touch the global scope (Sentry/JS `withScope`
+    /// isolation). The temporary scope is always popped, even if `body` throws.
+    @discardableResult
+    func withScope<T>(_ body: (Scope) throws -> T) rethrows -> T {
+        let local = scope.clone()
+        Self.activeScopeStack.append(local)
+        defer { Self.activeScopeStack.removeLast() }
+        return try body(local)
     }
 
     /// Open the release-health session (idempotent, fail-open, never blocks init).
@@ -127,9 +197,11 @@ public final class AllStakClient: @unchecked Sendable {
                       body: ["sessionId": sessionId, "durationMs": durationMs, "status": status])
     }
 
-    // visible for testing — pure payload construction, no network.
+    // visible for testing — pure payload construction, no network. When `scope`
+    // is non-nil (a `withScope` override) it is used; otherwise the client's
+    // global scope is attached.
     func buildEvent(exceptionClass: String, message: String, level: String,
-                    addresses: [UInt]) -> AllStakErrorEvent {
+                    addresses: [UInt], scope: Scope? = nil) -> AllStakErrorEvent {
         let frames = addresses.prefix(Self.maxFrames).map { addr in
             AllStakFrame(
                 function: nil,
@@ -137,10 +209,14 @@ public final class AllStakClient: @unchecked Sendable {
                 instructionAddr: "0x" + String(addr, radix: 16),
                 inApp: true)
         }
-        return AllStakErrorEvent(
+        // Precedence: explicit scope arg → active `withScope` override → global.
+        let snapshot = (scope ?? activeOverrideScope ?? self.scope).snapshot()
+        var event = AllStakErrorEvent(
             exceptionClass: exceptionClass,
             message: message,
-            level: level,
+            // A scope `level` override wins over the call-site level (Sentry/JS
+            // scope semantics).
+            level: snapshot.level ?? level,
             platform: "cocoa",
             environment: environment,
             release: release,
@@ -150,10 +226,13 @@ public final class AllStakClient: @unchecked Sendable {
             sdkName: Self.sdkName,
             sdkVersion: Self.sdkVersion,
             timestamp: Date().timeIntervalSince1970)
+        attachScope(snapshot, to: &event)
+        return event
     }
 
     // visible for testing — builds a fatal event from a persisted crash report,
-    // using the crash-time image layout passed in.
+    // using the crash-time image layout passed in. Crashes carry the global
+    // scope (breadcrumbs/user/tags accumulated before the crash).
     func buildCrashEvent(_ report: CrashReport, images: [AllStakBinaryImage]) -> AllStakErrorEvent {
         let frames = report.addresses.prefix(Self.maxFrames).map { addr in
             AllStakFrame(
@@ -162,7 +241,7 @@ public final class AllStakClient: @unchecked Sendable {
                 instructionAddr: "0x" + String(addr, radix: 16),
                 inApp: true)
         }
-        return AllStakErrorEvent(
+        var event = AllStakErrorEvent(
             exceptionClass: report.name,
             message: report.message,
             level: "fatal",
@@ -175,6 +254,21 @@ public final class AllStakClient: @unchecked Sendable {
             sdkName: Self.sdkName,
             sdkVersion: Self.sdkVersion,
             timestamp: report.timestamp)
+        attachScope(scope.snapshot(), to: &event)
+        return event
+    }
+
+    /// Copy a scope snapshot onto an event. Empty maps/arrays are left `nil` so
+    /// the encoder omits them and the existing wire shape is preserved when the
+    /// scope is unused. The scope `level` (when set) overrides the event level,
+    /// mirroring the Sentry-cocoa / JS scope semantics.
+    private func attachScope(_ s: Scope.Snapshot, to event: inout AllStakErrorEvent) {
+        event.breadcrumbs = s.breadcrumbs.isEmpty ? nil : s.breadcrumbs
+        event.user = s.user
+        event.tags = s.tags.isEmpty ? nil : s.tags
+        event.contexts = s.contexts.isEmpty ? nil : s.contexts
+        event.extra = s.extra.isEmpty ? nil : s.extra
+        event.fingerprint = s.fingerprint
     }
 
     func sendCrash(_ report: CrashReport, images: [AllStakBinaryImage]) {

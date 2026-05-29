@@ -130,6 +130,70 @@ public enum AllStak {
         current()?.capture(message: message, level: level)
     }
 
+    // MARK: - Scope
+
+    /// Record a breadcrumb on the global scope. Breadcrumbs are a FIFO ring
+    /// buffer (default cap 100) attached to subsequent captured events.
+    ///
+    /// - Parameters:
+    ///   - type: one of `default`/`debug`/`error`/`navigation`/`http`/`info`/
+    ///     `query`/`transaction`/`ui`/`user`; anything else falls back to
+    ///     `default`.
+    ///   - category: optional grouping label (e.g. `auth`, `ui.click`).
+    ///   - data: optional JSON-encodable structured payload.
+    public static func addBreadcrumb(type: String = "default",
+                                     message: String? = nil,
+                                     category: String? = nil,
+                                     level: String? = nil,
+                                     data: [String: Any]? = nil) {
+        current()?.addBreadcrumb(type: type, message: message, category: category,
+                                 level: level, data: data)
+    }
+
+    /// Attach a user to subsequent events. Only `id`/`email`/`ip` cross the wire.
+    public static func setUser(id: String? = nil, email: String? = nil,
+                               ip: String? = nil, username: String? = nil) {
+        current()?.setUser(id: id, email: email, ip: ip, username: username)
+    }
+
+    /// Detach the current user from the global scope.
+    public static func clearUser() { current()?.clearUser() }
+
+    public static func setTag(_ key: String, _ value: String) {
+        current()?.setTag(key, value)
+    }
+
+    public static func removeTag(_ key: String) { current()?.removeTag(key) }
+
+    public static func setTags(_ tags: [String: String]) { current()?.setTags(tags) }
+
+    /// Set (or, with `nil`, remove) a named context block.
+    public static func setContext(_ key: String, _ value: [String: Any]?) {
+        current()?.setContext(key, value)
+    }
+
+    public static func setExtra(_ key: String, _ value: Any?) {
+        current()?.setExtra(key, value)
+    }
+
+    public static func setExtras(_ extras: [String: Any]) {
+        current()?.setExtras(extras)
+    }
+
+    /// Mutate the global scope inline (Sentry-cocoa `configureScope`).
+    public static func configureScope(_ block: (Scope) -> Void) {
+        current()?.configureScope(block)
+    }
+
+    /// Run `body` with a temporary scope cloned from the global scope. Any
+    /// `AllStak.capture(...)` made inside the body (on the same thread) attaches
+    /// the temporary scope; its mutations never leak into the global scope.
+    @discardableResult
+    public static func withScope<T>(_ body: (Scope) throws -> T) rethrows -> T? {
+        guard let client = current() else { return nil }
+        return try client.withScope(body)
+    }
+
     private static func current() -> AllStakClient? {
         lock.lock(); defer { lock.unlock() }
         return client
