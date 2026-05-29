@@ -46,6 +46,17 @@ public enum AllStak {
     ///   one release-health session per app launch and ends it on graceful
     ///   shutdown (app termination / background→terminate). Set `false` to opt
     ///   out. Session tracking is always fail-open and never blocks launch.
+    /// - Parameter sendDefaultPii: when `false` (default, Sentry parity) email
+    ///   and IPv4 addresses found inside string values are redacted before the
+    ///   event is sent, in addition to the always-on credit-card + SSN scrubbers
+    ///   and the sensitive-key denylist. Set `true` to allow email/IP through
+    ///   (the financial/identity scrubbers and key denylist stay on regardless).
+    ///   The explicit user object you set via ``setUser(id:email:ip:username:)``
+    ///   is never value-scrubbed.
+    /// - Parameter beforeSend: a final filter run on every event at the wire
+    ///   chokepoint, BEFORE PII scrubbing. Return `nil` to drop the event, or a
+    ///   (possibly mutated) event to send. The hook sees real, un-scrubbed data;
+    ///   the wire payload is always scrubbed afterwards.
     public static func start(apiKey: String,
                              host: String = "https://api.allstak.sa",
                              environment: String? = nil,
@@ -53,12 +64,16 @@ public enum AllStak {
                              autoDetectRelease: Bool = true,
                              autoRegisterRelease: Bool = true,
                              enableCrashCapture: Bool = true,
-                             enableAutoSessionTracking: Bool = true) {
+                             enableAutoSessionTracking: Bool = true,
+                             sendDefaultPii: Bool = false,
+                             beforeSend: (@Sendable (AllStakErrorEvent) -> AllStakErrorEvent?)? = nil) {
         lock.lock()
         let newClient = AllStakClient(apiKey: apiKey, host: host, environment: environment,
                                       release: release, autoDetectRelease: autoDetectRelease,
                                       autoRegisterRelease: autoRegisterRelease,
-                                      enableAutoSessionTracking: enableAutoSessionTracking)
+                                      enableAutoSessionTracking: enableAutoSessionTracking,
+                                      sendDefaultPii: sendDefaultPii,
+                                      beforeSend: beforeSend)
         client = newClient
         lock.unlock()
 

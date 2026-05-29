@@ -30,6 +30,17 @@ public final class AllStakClient: @unchecked Sendable {
     private let session: URLSession
     private let autoRegisterRelease: Bool
 
+    /// PII-scrubbing config. When `sendDefaultPii` is `false` (default, Sentry
+    /// parity) the email/IPv4 value scrubbers run in addition to the always-on
+    /// credit-card + SSN scrubbers and the key denylist.
+    private let sanitizer: Sanitizer
+
+    /// Final, in-process filter run at the wire chokepoint BEFORE any POST and
+    /// BEFORE the sanitizer. Returning `nil` drops the event; the closure may
+    /// mutate the event. Sees real (un-scrubbed) data so a caller can inspect it;
+    /// the wire payload is always scrubbed afterwards.
+    private let beforeSend: (@Sendable (AllStakErrorEvent) -> AllStakErrorEvent?)?
+
     /// Release-health session tracker. `nil` when `enableAutoSessionTracking` is
     /// off (or under XCTest), in which case no session id is stamped on events.
     let sessionTracker: SessionTracker?
@@ -50,11 +61,15 @@ public final class AllStakClient: @unchecked Sendable {
     ///     `false` to opt out entirely. Automatically suppressed under XCTest.
     public init(apiKey: String, host: String, environment: String?, release: String?,
                 autoDetectRelease: Bool = true, autoRegisterRelease: Bool = true,
-                enableAutoSessionTracking: Bool = true) {
+                enableAutoSessionTracking: Bool = true,
+                sendDefaultPii: Bool = false,
+                beforeSend: (@Sendable (AllStakErrorEvent) -> AllStakErrorEvent?)? = nil) {
         self.apiKey = apiKey
         // Normalize trailing slash so host + path is well-formed.
         self.host = host.hasSuffix("/") ? String(host.dropLast()) : host
         self.environment = environment
+        self.sanitizer = Sanitizer(sendDefaultPii: sendDefaultPii)
+        self.beforeSend = beforeSend
         let resolvedRelease = ReleaseResolver.resolve(
             explicit: release,
             autoDetect: autoDetectRelease,
@@ -275,9 +290,38 @@ public final class AllStakClient: @unchecked Sendable {
         send(buildCrashEvent(report, images: images))
     }
 
-    private func send(_ event: AllStakErrorEvent) {
+    /// The single scrub point on the wire path. Visible for testing. Tries the
+    /// full sanitizer first; if it raises for any reason, falls back to a
+    /// key-only redaction (still removes the highest-risk secrets) so a scrubber
+    /// bug never drops telemetry. Worst case the original event is returned.
+    func sanitizedForWire(_ event: AllStakErrorEvent) -> AllStakErrorEvent {
+        let result = Result { sanitizer.sanitize(event) }
+        switch result {
+        case .success(let scrubbed):
+            return scrubbed
+        case .failure:
+            // Fail-open: degrade to key-only redaction rather than dropping.
+            return (try? sanitizer.keyOnlyRedaction(event)) ?? event
+        }
+    }
+
+    private func send(_ rawEvent: AllStakErrorEvent) {
+        // 1. beforeSend runs FIRST, on the real (un-scrubbed) data. It may mutate
+        //    the event or drop it entirely by returning nil. A throwing/failing
+        //    sanitizer must never undo this drop.
+        var event = rawEvent
+        if let beforeSend {
+            guard let filtered = beforeSend(event) else { return } // dropped
+            event = filtered
+        }
+
+        // 2. The sanitizer runs AFTER beforeSend so the wire payload is always
+        //    scrubbed regardless of what the hook did. Fail-open: if scrubbing
+        //    raises, fall back to a key-only redaction so telemetry is not lost.
+        let wireEvent = sanitizedForWire(event)
+
         guard let url = URL(string: host + "/ingest/v1/errors"),
-              let body = try? JSONEncoder().encode(event) else { return }
+              let body = try? JSONEncoder().encode(wireEvent) else { return }
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
