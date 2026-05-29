@@ -27,8 +27,19 @@ public final class AllStakClient: @unchecked Sendable {
     private let host: String
     private let environment: String?
     private let release: String?
-    private let session: URLSession
     private let autoRegisterRelease: Bool
+
+    /// Reliable transport: bounded retry + exponential backoff + jitter,
+    /// Retry-After handling, 401-disable, permanent-4xx drop, and a persistent
+    /// on-disk spool for transient failures. Replaces the prior fire-and-forget
+    /// `dataTask().resume()` that lost any failed/offline POST forever. All
+    /// senders (errors, messages, session start/end, next-launch crash flush,
+    /// release registration) route through this single transport.
+    let transport: Transport
+
+    /// Ingest paths reused across senders.
+    static let pathErrors = "/ingest/v1/errors"
+    static let pathReleases = "/ingest/v1/releases"
 
     /// PII-scrubbing config. When `sendDefaultPii` is `false` (default, Sentry
     /// parity) the email/IPv4 value scrubbers run in addition to the always-on
@@ -59,11 +70,33 @@ public final class AllStakClient: @unchecked Sendable {
     ///   - enableAutoSessionTracking: when `true` (default) the client opens a
     ///     release-health session at init and ends it on graceful shutdown. Set
     ///     `false` to opt out entirely. Automatically suppressed under XCTest.
-    public init(apiKey: String, host: String, environment: String?, release: String?,
-                autoDetectRelease: Bool = true, autoRegisterRelease: Bool = true,
-                enableAutoSessionTracking: Bool = true,
-                sendDefaultPii: Bool = false,
-                beforeSend: (@Sendable (AllStakErrorEvent) -> AllStakErrorEvent?)? = nil) {
+    public convenience init(apiKey: String, host: String, environment: String?, release: String?,
+                            autoDetectRelease: Bool = true, autoRegisterRelease: Bool = true,
+                            enableAutoSessionTracking: Bool = true,
+                            sendDefaultPii: Bool = false,
+                            beforeSend: (@Sendable (AllStakErrorEvent) -> AllStakErrorEvent?)? = nil) {
+        // Default production transport: ephemeral URLSession poster + the on-disk
+        // envelope spool (drained on init). Tests inject their own via the
+        // designated initializer below.
+        let normalizedHost = host.hasSuffix("/") ? String(host.dropLast()) : host
+        let poster = URLSessionPoster(session: URLSession(configuration: .ephemeral))
+        let spool = Self.isRunningUnderTests ? nil : EnvelopeSpool.defaultSpool()
+        let transport = Transport(baseURL: normalizedHost, apiKey: apiKey,
+                                  poster: poster, spool: spool)
+        self.init(apiKey: apiKey, host: host, environment: environment, release: release,
+                  autoDetectRelease: autoDetectRelease, autoRegisterRelease: autoRegisterRelease,
+                  enableAutoSessionTracking: enableAutoSessionTracking,
+                  sendDefaultPii: sendDefaultPii, beforeSend: beforeSend, transport: transport)
+    }
+
+    /// Designated initializer with an injectable ``Transport`` (test seam). The
+    /// public initializer above wires the production transport.
+    init(apiKey: String, host: String, environment: String?, release: String?,
+         autoDetectRelease: Bool = true, autoRegisterRelease: Bool = true,
+         enableAutoSessionTracking: Bool = true,
+         sendDefaultPii: Bool = false,
+         beforeSend: (@Sendable (AllStakErrorEvent) -> AllStakErrorEvent?)? = nil,
+         transport: Transport) {
         self.apiKey = apiKey
         // Normalize trailing slash so host + path is well-formed.
         self.host = host.hasSuffix("/") ? String(host.dropLast()) : host
@@ -75,18 +108,22 @@ public final class AllStakClient: @unchecked Sendable {
             autoDetect: autoDetectRelease,
             sdkVersion: Self.sdkVersion)
         self.release = resolvedRelease
-        let urlSession = URLSession(configuration: .ephemeral)
-        self.session = urlSession
         self.autoRegisterRelease = autoRegisterRelease
+        self.transport = transport
+
+        // Drain any envelopes spooled by a previous launch (failed/offline POSTs)
+        // through the transport, so they get the same retry/backoff/persist
+        // treatment. Fully fail-open; never blocks init.
+        transport.drainSpool()
 
         // Release-health sessions are never sampled, but skip them automatically
         // under the test runtime (mirrors the Java SDK's unit-test guard) and
         // honour the opt-out flag.
         if enableAutoSessionTracking && !Self.isRunningUnderTests {
-            let host = self.host
-            let apiKey = self.apiKey
-            // Reuse the existing transport/HTTP path: fire-and-forget POST with
-            // the same X-AllStak-Key auth header other ingest calls use.
+            // Route session start/end through the SAME reliable transport. Session
+            // lifecycle paths are best-effort live-only — the spool refuses them
+            // (`isPersistablePath`), so a failed session POST is retried in-flight
+            // but never persisted/replayed (a stale session would skew durations).
             self.sessionTracker = SessionTracker(
                 release: resolvedRelease ?? Self.sdkVersion,
                 environment: environment,
@@ -94,9 +131,8 @@ public final class AllStakClient: @unchecked Sendable {
                 sdkVersion: Self.sdkVersion,
                 platform: "cocoa",
                 transportEnabled: !apiKey.isEmpty,
-                sender: { [session = urlSession] path, body in
-                    Self.postJSON(session: session, host: host, apiKey: apiKey,
-                                  path: path, body: body)
+                sender: { [transport] path, body in
+                    Self.postJSON(transport: transport, path: path, body: body)
                 })
         } else {
             self.sessionTracker = nil
@@ -207,8 +243,7 @@ public final class AllStakClient: @unchecked Sendable {
     /// session left open by a crash is still closed with the right status.
     func endPreviousSession(sessionId: String, durationMs: Int, status: String) {
         guard !apiKey.isEmpty else { return }
-        Self.postJSON(session: session, host: host, apiKey: apiKey,
-                      path: SessionTracker.pathEnd,
+        Self.postJSON(transport: transport, path: SessionTracker.pathEnd,
                       body: ["sessionId": sessionId, "durationMs": durationMs, "status": status])
     }
 
@@ -290,6 +325,25 @@ public final class AllStakClient: @unchecked Sendable {
         send(buildCrashEvent(report, images: images))
     }
 
+    /// Flush a crash report recorded on a PREVIOUS launch through the reliable
+    /// transport, invoking `onResolved` once the delivery settles. The crash event
+    /// is built + scrubbed here and the resulting bytes are delivered with full
+    /// retry/backoff/persist; `onResolved(.settled)` means the caller may delete
+    /// the on-disk crash record (2xx / permanent / spooled), `.keepSource` means
+    /// keep it for a later launch. Fixes the prior "clear after one unacked send"
+    /// bug. If the event is dropped (beforeSend) or cannot be encoded, the source
+    /// is settled (it will never become sendable). Fail-open.
+    func flushCrash(_ report: CrashReport, images: [AllStakBinaryImage],
+                    onResolved: @escaping @Sendable (Transport.Resolution) -> Void) {
+        let event = buildCrashEvent(report, images: images)
+        guard let body = scrubbedBody(event) else {
+            // Dropped by beforeSend or unencodable → never sendable; clear source.
+            onResolved(.settled)
+            return
+        }
+        transport.flushCrash(path: Self.pathErrors, body: body, onResolved: onResolved)
+    }
+
     /// The single scrub point on the wire path. Visible for testing. Tries the
     /// full sanitizer first; if it raises for any reason, falls back to a
     /// key-only redaction (still removes the highest-risk secrets) so a scrubber
@@ -306,56 +360,48 @@ public final class AllStakClient: @unchecked Sendable {
     }
 
     private func send(_ rawEvent: AllStakErrorEvent) {
-        // 1. beforeSend runs FIRST, on the real (un-scrubbed) data. It may mutate
-        //    the event or drop it entirely by returning nil. A throwing/failing
-        //    sanitizer must never undo this drop.
-        var event = rawEvent
-        if let beforeSend {
-            guard let filtered = beforeSend(event) else { return } // dropped
-            event = filtered
-        }
-
-        // 2. The sanitizer runs AFTER beforeSend so the wire payload is always
-        //    scrubbed regardless of what the hook did. Fail-open: if scrubbing
-        //    raises, fall back to a key-only redaction so telemetry is not lost.
-        let wireEvent = sanitizedForWire(event)
-
-        guard let url = URL(string: host + "/ingest/v1/errors"),
-              let body = try? JSONEncoder().encode(wireEvent) else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(apiKey, forHTTPHeaderField: "X-AllStak-Key")
-        req.httpBody = body
-        session.dataTask(with: req).resume() // fire-and-forget; never block the host app
+        guard let body = scrubbedBody(rawEvent) else { return } // dropped by beforeSend / unencodable
+        transport.send(path: Self.pathErrors, body: body)
     }
 
-    /// Fire-and-forget JSON POST reusing the SDK's existing transport shape
-    /// (ephemeral `URLSession`, `X-AllStak-Key` auth, never blocks the host app).
-    /// Used by the session tracker for `/sessions/start` and `/sessions/end`.
-    /// Nil values are dropped so optional fields are simply absent from the body.
-    static func postJSON(session: URLSession, host: String, apiKey: String,
-                         path: String, body: [String: Any?]) {
+    /// Produce the exact ALREADY-SCRUBBED bytes that would be POSTed for an event,
+    /// or `nil` when `beforeSend` drops it or encoding fails. Visible for the
+    /// crash-flush path so a crash report can be persisted as scrubbed bytes.
+    ///
+    /// 1. `beforeSend` runs FIRST on the real (un-scrubbed) data — it may mutate
+    ///    or drop the event (`nil`). 2. The sanitizer runs AFTER so the wire
+    ///    payload is always scrubbed (fail-open to key-only redaction).
+    func scrubbedBody(_ rawEvent: AllStakErrorEvent) -> Data? {
+        var event = rawEvent
+        if let beforeSend {
+            guard let filtered = beforeSend(event) else { return nil } // dropped
+            event = filtered
+        }
+        let wireEvent = sanitizedForWire(event)
+        return try? JSONEncoder().encode(wireEvent)
+    }
+
+    /// JSON POST through the reliable ``Transport`` (retry/backoff/Retry-After/
+    /// 401-disable; session paths are not spooled). Used by the session tracker
+    /// for `/sessions/start` + `/end`. Nil values are dropped so optional fields
+    /// are simply absent from the body.
+    static func postJSON(transport: Transport, path: String, body: [String: Any?]) {
         var compact: [String: Any] = [:]
         for (k, v) in body { if let v { compact[k] = v } }
-        guard let url = URL(string: host + path),
-              let data = try? JSONSerialization.data(withJSONObject: compact) else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.timeoutInterval = 5 // short timeout; session I/O must never stall shutdown
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(apiKey, forHTTPHeaderField: "X-AllStak-Key")
-        req.httpBody = data
-        session.dataTask(with: req).resume()
+        guard let data = try? JSONSerialization.data(withJSONObject: compact) else { return }
+        transport.send(path: path, body: data)
     }
 
     private func registerRuntimeRelease() {
+        // Skip under the test runtime using the same robust guard the session
+        // tracker uses (env var + swift-testing flag + loaded-XCTest fallback),
+        // not just `XCTestConfigurationFilePath` — so a test never emits a real
+        // release POST through the transport.
         guard autoRegisterRelease,
               !apiKey.isEmpty,
               let release,
               !release.isEmpty,
-              ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil,
-              let url = URL(string: host + "/ingest/v1/releases") else { return }
+              !Self.isRunningUnderTests else { return }
         let payload: [String: String?] = [
             "version": release,
             "environment": environment,
@@ -365,11 +411,6 @@ public final class AllStakClient: @unchecked Sendable {
             "message": nil
         ]
         guard let body = try? JSONEncoder().encode(payload) else { return }
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(apiKey, forHTTPHeaderField: "X-AllStak-Key")
-        req.httpBody = body
-        session.dataTask(with: req).resume()
+        transport.send(path: Self.pathReleases, body: body)
     }
 }

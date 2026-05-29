@@ -53,19 +53,29 @@ public enum CrashReporter {
         SignalCrashHandler.install(crashFileURL: store.signalCrashFileURL())
     }
 
+    /// Send crashes recorded in previous launches through the reliable transport,
+    /// removing each on-disk record ONLY after the transport acknowledges it
+    /// (2xx / permanent 4xx / 401 / handed to the persistent spool). Previously
+    /// every record was cleared after a single fire-and-forget POST regardless of
+    /// HTTP success — a failed/offline flush silently lost the crash. Now a record
+    /// that could not be delivered AND could not be spooled is KEPT for the next
+    /// launch. Each flush is async/detached and fail-open; never blocks launch.
     static func sendPending(store: CrashStore, client: AllStakClient) {
-        var reports = store.pendingReports()
-        // A signal crash from the previous launch is persisted as a raw binary
-        // record by the handler; parse it (normal context) and treat it like any
-        // other pending report.
-        if let signalReport = store.pendingSignalReport() {
-            reports.append(signalReport)
-        }
-        guard !reports.isEmpty else { return }
         let images = store.sessionImages()
-        for report in reports {
-            client.sendCrash(report, images: images)
+
+        // NSException records: one file each, removed only after ack.
+        for (url, report) in store.pendingReportsWithURLs() {
+            client.flushCrash(report, images: images) { resolution in
+                if resolution == .settled { store.removeReport(at: url) }
+            }
         }
-        store.clearReports()
+
+        // Signal crash: a single fixed-location binary record. Parsed NON-
+        // destructively (peek) so it's removed only after the transport acks it.
+        if let signalReport = store.peekSignalReport() {
+            client.flushCrash(signalReport, images: images) { resolution in
+                if resolution == .settled { store.removeSignalReport() }
+            }
+        }
     }
 }

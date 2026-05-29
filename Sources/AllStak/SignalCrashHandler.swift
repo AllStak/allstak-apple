@@ -389,6 +389,19 @@ enum SignalCrashHandler {
         return makeReport(from: parsed)
     }
 
+    /// Parse a persisted signal-crash record WITHOUT deleting it, so the caller
+    /// can remove it only after the transport acknowledges the resulting event
+    /// (avoiding a clear-before-ack data loss). An unparseable record is deleted
+    /// immediately (it can never become a sendable event) and `nil` is returned.
+    static func peekPendingReport(crashFileURL: URL) -> CrashReport? {
+        guard let data = try? Data(contentsOf: crashFileURL) else { return nil }
+        guard let parsed = SignalCrashRecord.parse(data), !data.isEmpty else {
+            try? FileManager.default.removeItem(at: crashFileURL) // corrupt → drop
+            return nil
+        }
+        return makeReport(from: parsed)
+    }
+
     /// Convert a parsed record into the shared `CrashReport` model. Pulled out so
     /// it can be unit-tested directly.
     static func makeReport(from parsed: SignalCrashRecord.Parsed) -> CrashReport {

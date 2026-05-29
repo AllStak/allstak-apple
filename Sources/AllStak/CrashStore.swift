@@ -67,6 +67,19 @@ public final class CrashStore: @unchecked Sendable {
         SignalCrashHandler.readPendingReport(crashFileURL: signalCrashFileURL())
     }
 
+    /// Non-destructively parse the pending signal-crash record (does NOT delete
+    /// the file). Used by the next-launch flush so the signal record is removed
+    /// only AFTER the transport acknowledges it — never on an unacked send. A
+    /// record that fails to parse is removed immediately (it can never be sent).
+    public func peekSignalReport() -> CrashReport? {
+        SignalCrashHandler.peekPendingReport(crashFileURL: signalCrashFileURL())
+    }
+
+    /// Remove the pending signal-crash record (after the transport acknowledges it).
+    public func removeSignalReport() {
+        try? fileManager.removeItem(at: signalCrashFileURL())
+    }
+
     /// Default location: <caches>/com.allstak/crashes
     public static func defaultStore() -> CrashStore {
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
@@ -81,12 +94,30 @@ public final class CrashStore: @unchecked Sendable {
     }
 
     public func pendingReports() -> [CrashReport] {
+        pendingReportsWithURLs().map { $0.report }
+    }
+
+    /// Pending crash reports paired with their backing file URL, so a caller can
+    /// remove an INDIVIDUAL report only after it has been acknowledged by the
+    /// transport (2xx / permanent / spooled) — fixing the "clear after one
+    /// unacked send" bug where every report was dropped after a single fire-and-
+    /// forget POST regardless of HTTP success.
+    public func pendingReportsWithURLs() -> [(url: URL, report: CrashReport)] {
         guard let files = try? fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else {
             return []
         }
         return files
             .filter { $0.pathExtension == "crash" }
-            .compactMap { try? JSONDecoder().decode(CrashReport.self, from: Data(contentsOf: $0)) }
+            .compactMap { url in
+                guard let data = try? Data(contentsOf: url),
+                      let report = try? JSONDecoder().decode(CrashReport.self, from: data) else { return nil }
+                return (url, report)
+            }
+    }
+
+    /// Remove a single crash report file (after the transport acknowledges it).
+    public func removeReport(at url: URL) {
+        try? fileManager.removeItem(at: url)
     }
 
     public func clearReports() {
