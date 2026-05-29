@@ -56,6 +56,12 @@ public final class AllStakClient: @unchecked Sendable {
     /// off (or under XCTest), in which case no session id is stamped on events.
     let sessionTracker: SessionTracker?
 
+    /// Per-process distributed-trace id (32 hex). One trace per app launch — every
+    /// auto-instrumented outbound request becomes a child span of this head-of-
+    /// trace, exactly like the JS SDK's sticky head-of-trace. Lazily stable for the
+    /// lifetime of the client so all requests in a launch correlate.
+    let traceId: String = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+
     /// The global scope shared across this client. Breadcrumbs / user / tags /
     /// contexts / extra accumulated here are attached to every captured event.
     let scope = Scope()
@@ -390,6 +396,28 @@ public final class AllStakClient: @unchecked Sendable {
         for (k, v) in body { if let v { compact[k] = v } }
         guard let data = try? JSONSerialization.data(withJSONObject: compact) else { return }
         transport.send(path: path, body: data)
+    }
+
+    /// Install automatic outbound HTTP instrumentation (sentry-cocoa-style).
+    /// Records redacted `http` breadcrumbs into the client's scope and injects W3C
+    /// trace headers using this client's per-launch ``traceId`` + the active
+    /// release-health session id. Skips the SDK's own ingest host. Suppressed under
+    /// XCTest (so a unit test never patches the test runner's networking) and
+    /// behind an empty-API-key guard. Fully fail-open.
+    func installHTTPInstrumentation() {
+        guard !Self.isRunningUnderTests else { return }
+        let traceId = self.traceId
+        let sessionProvider = { [weak sessionTracker] in sessionTracker?.currentSessionId }
+        HTTPInstrumentation.shared.install(
+            scope: scope,
+            ingestHost: host,
+            sanitizer: sanitizer,
+            traceProvider: {
+                HTTPInstrumentation.TraceContext(
+                    traceId: traceId,
+                    sessionId: sessionProvider(),
+                    sampled: true)
+            })
     }
 
     private func registerRuntimeRelease() {

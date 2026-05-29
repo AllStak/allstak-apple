@@ -53,6 +53,13 @@ public enum AllStak {
     ///   (the financial/identity scrubbers and key denylist stay on regardless).
     ///   The explicit user object you set via ``setUser(id:email:ip:username:)``
     ///   is never value-scrubbed.
+    /// - Parameter enableAutoHttpInstrumentation: when `true` (default) the SDK
+    ///   automatically observes outbound `URLSession` requests the host app makes,
+    ///   recording a redacted `http` breadcrumb (method / redacted URL / status /
+    ///   duration / response size, failures included) into the scope and — when a
+    ///   trace context exists — attaching W3C `traceparent` + `baggage` headers for
+    ///   distributed tracing. The SDK's own ingest host is always skipped. Set
+    ///   `false` to opt out. Fully fail-open; never breaks the host's networking.
     /// - Parameter beforeSend: a final filter run on every event at the wire
     ///   chokepoint, BEFORE PII scrubbing. Return `nil` to drop the event, or a
     ///   (possibly mutated) event to send. The hook sees real, un-scrubbed data;
@@ -65,6 +72,7 @@ public enum AllStak {
                              autoRegisterRelease: Bool = true,
                              enableCrashCapture: Bool = true,
                              enableAutoSessionTracking: Bool = true,
+                             enableAutoHttpInstrumentation: Bool = true,
                              sendDefaultPii: Bool = false,
                              beforeSend: (@Sendable (AllStakErrorEvent) -> AllStakErrorEvent?)? = nil) {
         lock.lock()
@@ -96,6 +104,14 @@ public enum AllStak {
                 startedAt: Date().timeIntervalSince1970,
                 status: SessionStatus.ok.wireValue))
             installLifecycleObservers()
+        }
+
+        // Install automatic outbound HTTP instrumentation (breadcrumbs + W3C trace
+        // propagation). Fail-open and a no-op under XCTest.
+        if enableAutoHttpInstrumentation {
+            newClient.installHTTPInstrumentation()
+        } else {
+            HTTPInstrumentation.shared.disable()
         }
     }
 

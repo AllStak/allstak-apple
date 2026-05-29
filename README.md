@@ -42,6 +42,25 @@ do { try risky() } catch { AllStak.capture(error) }
 AllStak.capture(message: "checkout failed", level: "warning")
 ```
 
+## Automatic HTTP instrumentation
+
+On by default, the SDK observes the outbound `URLSession` requests your app makes
+and records a redacted `http` breadcrumb for each — method, **query-stripped** URL,
+status code, duration, and response size — including failed requests. When a trace
+context exists it also attaches W3C `traceparent` + `baggage` headers to the
+outbound request for distributed tracing, so a request that lands on your AllStak
+backend correlates with the mobile session that made it.
+
+It is fail-open and never breaks your networking: the SDK's own ingest host is
+always skipped (no recursion), URLs and recorded metadata are run through the same
+PII redaction as everything else (no tokens in breadcrumb URLs), and on any
+internal failure the request is forwarded untouched. Opt out with:
+
+```swift
+AllStak.start(apiKey: "astk_live_xxxxxxxx",
+              enableAutoHttpInstrumentation: false)
+```
+
 ## Release identifier (automatic)
 
 If you omit `release`, the SDK auto-detects it. Resolution order, highest first:
