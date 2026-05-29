@@ -15,7 +15,10 @@ symbolication**: native instruction addresses + the process's loaded-image UUIDs
 > chains the previous handler, and re-raises so the OS crash report still generates.
 > The record writer and the next-launch reader/parser are unit-tested; the live
 > in-process handler is **pending on-device verification** (a real SIGSEGV can't be
-> raised safely in CI). On the roadmap: scope/breadcrumbs and dSYM upload tooling.
+> raised safely in CI). Build-time **dSYM upload tooling** for server-side
+> symbolication ships in [`Scripts/`](Scripts/allstak-upload-dsyms.sh) (see
+> [Uploading dSYMs](#uploading-dsyms-server-side-symbolication)). On the roadmap:
+> scope/breadcrumbs.
 
 ## Install (Swift Package Manager)
 
@@ -110,6 +113,93 @@ The backend matches each frame's image by **UUID** to the **dSYM you upload for 
 release**, computes the static address (`instructionAddr − imageAddr + __TEXT
 vmaddr`), and resolves it to `file:line:symbol` with `llvm-symbolizer` (including
 inlined frames). Upload your build's dSYM in CI so events for that release resolve.
+
+## Uploading dSYMs (server-side symbolication)
+
+Symbolication happens on the server, so the backend needs the **dSYM** for every
+release you ship. Use the bundled uploader at
+[`Scripts/allstak-upload-dsyms.sh`](Scripts/allstak-upload-dsyms.sh) — a
+dependency-free POSIX shell script (only `curl`) that finds your `.dSYM` bundles,
+locates the DWARF Mach-O inside each (`Contents/Resources/DWARF/<binary>`), and
+uploads the raw binary to AllStak. A universal dSYM registers one slice per arch
+server-side (the server reads each slice's `LC_UUID`/`debugId` + `__TEXT` vmaddr).
+
+It is build-time / CI tooling only — it is **not** part of the runtime SDK and
+does not affect `swift build` / `swift test`.
+
+### Credentials
+
+The upload uses a **user/CI bearer token with the `SOURCEMAPS_UPLOAD`
+capability**, scoped to a project id. This is **not** the runtime `X-AllStak-Key`
+ingest key — never bake an upload token into your app.
+
+| Input | Flag | Env var |
+|-------|------|---------|
+| API base URL | `--api` | `ALLSTAK_API` |
+| Project id (UUID) | `--project-id` | `ALLSTAK_PROJECT_ID` |
+| Bearer upload token | `--token` | `ALLSTAK_AUTH_TOKEN` |
+| dSYM search path(s) | `--path` (repeatable) | Xcode `DWARF_DSYM_FOLDER_PATH` / `DWARF_DSYM_FILE_NAME` |
+
+`--dry-run` prints what would be uploaded and makes no network calls. The script
+is idempotent and CI-friendly: exit `0` = all uploaded, `1` = bad usage / missing
+credential, `2` = an upload failed (or a file exceeded the 64 MB limit), `3` = no
+dSYM found.
+
+```sh
+# Manual / local upload of an archive's dSYMs:
+ALLSTAK_API=https://api.allstak.sa \
+ALLSTAK_PROJECT_ID=11111111-2222-3333-4444-555555555555 \
+ALLSTAK_AUTH_TOKEN=ci-upload-token \
+  Scripts/allstak-upload-dsyms.sh --path "MyApp.xcarchive/dSYMs"
+
+# See what it would do, no network:
+Scripts/allstak-upload-dsyms.sh --dry-run --path "MyApp.xcarchive/dSYMs"
+```
+
+### Xcode "Run Script" build phase
+
+Add a **Run Script** phase (Target → Build Phases → +) **after** "Compile
+Sources". Xcode exports `DWARF_DSYM_FOLDER_PATH` / `DWARF_DSYM_FILE_NAME`, so the
+script needs no `--path`. Set `DEBUG_INFORMATION_FORMAT = DWARF with dSYM File`
+(the default for Release/Archive) so a dSYM is actually produced.
+
+```sh
+# Only upload for release builds; keep debug builds fast.
+if [ "${CONFIGURATION}" != "Release" ]; then
+  echo "[allstak] skipping dSYM upload for ${CONFIGURATION}"
+  exit 0
+fi
+
+export ALLSTAK_API="https://api.allstak.sa"
+export ALLSTAK_PROJECT_ID="11111111-2222-3333-4444-555555555555"
+# Provide ALLSTAK_AUTH_TOKEN via the build environment / a CI secret —
+# do NOT hard-code an upload token in the project file.
+
+"${SRCROOT}/Scripts/allstak-upload-dsyms.sh"
+```
+
+(For SwiftPM-consumed projects, point `${SRCROOT}` at wherever you vendor the
+script, or call it from the checkout under `…/allstak-apple/Scripts/`.)
+
+### CI example (GitHub Actions)
+
+```yaml
+- name: Archive
+  run: |
+    xcodebuild -scheme MyApp -configuration Release \
+      -archivePath build/MyApp.xcarchive archive
+
+- name: Upload dSYMs to AllStak
+  env:
+    ALLSTAK_API: https://api.allstak.sa
+    ALLSTAK_PROJECT_ID: ${{ vars.ALLSTAK_PROJECT_ID }}
+    ALLSTAK_AUTH_TOKEN: ${{ secrets.ALLSTAK_UPLOAD_TOKEN }}
+  run: |
+    ./Scripts/allstak-upload-dsyms.sh --path build/MyApp.xcarchive/dSYMs
+```
+
+Run it for the **same release** your app reports (see the release section above)
+so crash events for that build resolve to `file:line:symbol`.
 
 ## Field contract
 
