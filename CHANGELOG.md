@@ -37,11 +37,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   macOS 11+, tvOS 13+), so the SDK installs via Swift Package Manager **or**
   CocoaPods. Its version is kept in lockstep with the runtime SDK version
   constant, guarded by `AllStakVersionParityTests`.
+- **App-hang (ANR) detection.** A background watchdog pings the main queue and
+  records an "App Hanging" warning event (best-effort main-thread stack) when the
+  main thread is unresponsive past `appHangTimeoutInterval` (default 2.0s),
+  resolving when it recovers. Gated by `enableAppHangTracking` (default on).
+- **Watchdog / OOM termination tracking.** Per-launch run-state markers infer a
+  `watchdog_termination` on the next launch only when the prior foreground run
+  left a marker with no recorded crash and no app/OS update or debugger — a pure
+  decision table that avoids false positives. Gated by
+  `enableWatchdogTerminationTracking` (default on).
+- **MetricKit ingestion.** An optional `MXMetricManager` subscriber (iOS 14+ /
+  macOS 12+, `canImport(MetricKit)`-guarded) feeds `MXCrashDiagnostic` /
+  `MXHangDiagnostic` into the same capture path. Gated by `enableMetricKit`;
+  inert where MetricKit is unavailable.
 
 ### Not yet implemented (roadmap)
 
-- App-hang / ANR detection (main-thread watchdog).
-- OOM / watchdog-termination heuristics and MetricKit ingestion.
-- On-device end-to-end verification of the live signal handler.
+- On-device end-to-end verification of the live signal handler and the live
+  app-hang / watchdog timers.
 - Performance tracing / spans, profiling, UI auto-instrumentation, attachments,
   and screenshots.
