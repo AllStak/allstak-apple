@@ -4,9 +4,10 @@ Official AllStak SDK for Apple platforms (iOS / macOS / tvOS), Swift. Captures
 errors and reports them to AllStak with the data needed for **server-side dSYM
 symbolication**: native instruction addresses + the process's loaded-image UUIDs.
 
-> Status: early (0.2.0), dependency-free (Foundation / Darwin / MachO only — no
-> third-party pods). Installable via Swift Package Manager **or** CocoaPods (see
-> [Install](#install)). The full, current feature set is below.
+> Status: live-certified for the reliability contract (0.2.0), dependency-free
+> (Foundation / Darwin / MachO only — no third-party pods). Installable via
+> Swift Package Manager **or** CocoaPods (see [Install](#install)). The full,
+> current feature set is below.
 
 ## Features
 
@@ -35,6 +36,9 @@ What the SDK supports today (all our own code, Foundation-only):
 - **Outbound HTTP instrumentation** — automatic `URLSession` breadcrumbs
   (method, query-stripped URL, status, duration, size) with W3C
   `traceparent` + `baggage` propagation; the ingest host is always skipped.
+- **Custom span capture** — `AllStak.captureSpan(...)` posts completed spans to
+  `/ingest/v1/spans` through the same reliable transport and normalizes IDs to
+  W3C trace/span widths.
 - **Automatic UI / navigation / lifecycle breadcrumbs** — `UIViewController`
   appear/disappear (`navigation` + `ui` breadcrumbs with the screen's class and
   title) and app-state transitions (`app.lifecycle` breadcrumbs:
@@ -56,8 +60,7 @@ Implemented above (now also including **app-hang / ANR** detection,
   writer and the next-launch reader/parser are unit-tested; raising a real
   SIGSEGV in-process can't be done safely in CI, so the live handler still needs
   device verification.
-- Performance tracing / spans, profiling, attachments, and screenshots are out
-  of scope for now.
+- Profiling, attachments, and screenshots are out of scope for now.
 
 ## Install
 
@@ -94,7 +97,31 @@ do { try risky() } catch { AllStak.capture(error) }
 
 // Or a message:
 AllStak.capture(message: "checkout failed", level: "warning")
+
+// Or a completed custom span:
+AllStak.captureSpan(
+    traceId: traceId,
+    spanId: spanId,
+    parentSpanId: parentSpanId,
+    operation: "db.sqlite.query",
+    description: "SELECT 1",
+    durationMs: 12,
+    startTimeMillis: startMs,
+    endTimeMillis: endMs
+)
 ```
+
+For app extensions, command-line tools, tests, or explicit shutdown paths,
+flush/close are available and timeout-bounded:
+
+```swift
+let flushed = await AllStak.flush(timeout: 5)
+let closed = await AllStak.close(timeout: 5)
+let diagnostics = AllStak.getDiagnostics()
+```
+
+`diagnostics` contains counters and queue sizes only; it never includes event
+payloads, breadcrumbs, headers, user data, or other sensitive values.
 
 ## Automatic HTTP instrumentation
 

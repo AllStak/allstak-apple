@@ -1,4 +1,7 @@
 import XCTest
+#if canImport(Compression)
+import Compression
+#endif
 @testable import AllStak
 
 /// Event-shape + config tests for app-hang / watchdog-termination / MetricKit
@@ -17,13 +20,48 @@ final class AppHangWatchdogEventTests: XCTestCase {
         func bodies() -> [Data] { lock.lock(); defer { lock.unlock() }; return _bodies }
         func post(url: URL, headers: [String: String], body: Data) async throws
             -> (status: Int, retryAfter: String?) {
+            let decodedBody = Self.decodedBody(headers: headers, body: body)
             lock.lock()
-            _bodies.append(body)
+            _bodies.append(decodedBody)
             let fire = !fulfilled ? onFirst : nil
             fulfilled = true
             lock.unlock()
             fire?()
             return (200, nil)
+        }
+
+        private static func decodedBody(headers: [String: String], body: Data) -> Data {
+            guard headers["Content-Encoding"]?.lowercased() == "gzip" else { return body }
+            return gunzip(body) ?? body
+        }
+
+        private static func gunzip(_ data: Data) -> Data? {
+            #if canImport(Compression)
+            let bytes = [UInt8](data)
+            guard bytes.count >= 18,
+                  bytes[0] == 0x1f,
+                  bytes[1] == 0x8b,
+                  bytes[2] == 0x08 else { return nil }
+            let expectedSize =
+                Int(bytes[bytes.count - 4]) |
+                (Int(bytes[bytes.count - 3]) << 8) |
+                (Int(bytes[bytes.count - 2]) << 16) |
+                (Int(bytes[bytes.count - 1]) << 24)
+            let compressed = Array(bytes[10..<(bytes.count - 8)])
+            var output = [UInt8](repeating: 0, count: expectedSize)
+            let written = compressed.withUnsafeBufferPointer { src in
+                output.withUnsafeMutableBufferPointer { dst in
+                    guard let srcBase = src.baseAddress, let dstBase = dst.baseAddress else { return 0 }
+                    return compression_decode_buffer(dstBase, dst.count,
+                                                     srcBase, src.count,
+                                                     nil, COMPRESSION_ZLIB)
+                }
+            }
+            guard written == expectedSize else { return nil }
+            return Data(output.prefix(written))
+            #else
+            return nil
+            #endif
         }
     }
 

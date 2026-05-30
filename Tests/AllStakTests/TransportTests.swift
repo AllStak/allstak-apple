@@ -1,4 +1,7 @@
 import XCTest
+#if canImport(Compression)
+import Compression
+#endif
 @testable import AllStak
 
 /// Reliable-transport behavior: retry then persist, drain-on-init + remove-after-2xx,
@@ -29,7 +32,7 @@ final class TransportTests: XCTestCase {
             }
             static func networkError() -> Response { Response(httpStatus: nil, retryAfter: nil, throwsError: true) }
         }
-        struct Request { let url: URL; let body: Data }
+        struct Request { let url: URL; let headers: [String: String]; let body: Data }
 
         private let lock = NSLock()
         private var script: [Response]
@@ -41,6 +44,7 @@ final class TransportTests: XCTestCase {
         init(_ script: [Response]) { self.script = script }
 
         func requestCount() -> Int { lock.lock(); defer { lock.unlock() }; return requests.count }
+        func recordedRequests() -> [Request] { lock.lock(); defer { lock.unlock() }; return requests }
 
         /// Record the request and pop the next scripted response under the lock,
         /// kept out of the async method so the lock is never held across an await.
@@ -55,7 +59,7 @@ final class TransportTests: XCTestCase {
 
         func post(url: URL, headers: [String: String], body: Data) async throws
             -> (status: Int, retryAfter: String?) {
-            let (resp, count, target) = record(Request(url: url, body: body))
+            let (resp, count, target) = record(Request(url: url, headers: headers, body: body))
             if let target, count >= target.count { target.fulfill() }
             if resp.throwsError { throw URLError(.notConnectedToInternet) }
             return (resp.httpStatus ?? 200, resp.retryAfter)
@@ -72,6 +76,34 @@ final class TransportTests: XCTestCase {
                   spool: spool, sleep: noSleep, randomUnit: fixedJitter)
     }
 
+    func testFlushWaitsForInFlightSend() async {
+        let poster = StubPoster([.ok()])
+        let spool = EnvelopeSpool(directory: tempDir())
+        let transport = makeTransport(poster: poster, spool: spool)
+
+        transport.send(path: "/ingest/v1/errors", body: body("{}"))
+
+        let flushed = await transport.flush(timeout: 2)
+        XCTAssertTrue(flushed)
+        XCTAssertEqual(poster.requestCount(), 1)
+        XCTAssertEqual(transport.stats().eventsSent, 1)
+    }
+
+    func testFlushReturnsFalseOnHardTimeout() async {
+        final class SlowPoster: HTTPPoster, @unchecked Sendable {
+            func post(url: URL, headers: [String: String], body: Data) async throws -> (status: Int, retryAfter: String?) {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                return (200, nil)
+            }
+        }
+
+        let transport = makeTransport(poster: SlowPoster(), spool: nil)
+        transport.send(path: "/ingest/v1/errors", body: body("{}"))
+
+        let flushed = await transport.flush(timeout: 0.01)
+        XCTAssertFalse(flushed)
+    }
+
     // MARK: 2xx — sent once, nothing spooled
 
     func test2xxSendsOnceAndDoesNotSpool() {
@@ -85,6 +117,51 @@ final class TransportTests: XCTestCase {
         wait(for: [exp], timeout: 2)
         XCTAssertEqual(poster.requestCount(), 1, "a 2xx is delivered exactly once")
         XCTAssertEqual(spool.count(), 0, "an accepted event is never spooled")
+    }
+
+    func testSmallPayloadSentUncompressedAndCounted() {
+        let poster = StubPoster([.ok()])
+        let exp = expectation(description: "posted")
+        poster.onCount = (1, exp.fulfill)
+        let spool = EnvelopeSpool(directory: tempDir())
+        let transport = makeTransport(poster: poster, spool: spool)
+        let payload = body("{\"message\":\"small\"}")
+
+        transport.send(path: "/ingest/v1/errors", body: payload)
+        wait(for: [exp], timeout: 2)
+
+        let req = poster.recordedRequests()[0]
+        XCTAssertNil(req.headers["Content-Encoding"])
+        XCTAssertEqual(req.body, payload)
+        let stats = transport.stats()
+        XCTAssertEqual(stats.uncompressedPayloads, 1)
+        XCTAssertEqual(stats.compressedPayloads, 0)
+        XCTAssertEqual(stats.compressionBytesSaved, 0)
+    }
+
+    func testLargePayloadSentWithGzipAndCounted() throws {
+        #if canImport(Compression)
+        let poster = StubPoster([.ok()])
+        let exp = expectation(description: "posted")
+        poster.onCount = (1, exp.fulfill)
+        let spool = EnvelopeSpool(directory: tempDir())
+        let transport = makeTransport(poster: poster, spool: spool)
+        let payload = body("{\"message\":\"" + String(repeating: "repeat-", count: 700) + "\"}")
+
+        transport.send(path: "/ingest/v1/errors", body: payload)
+        wait(for: [exp], timeout: 2)
+
+        let req = poster.recordedRequests()[0]
+        XCTAssertEqual(req.headers["Content-Encoding"], "gzip")
+        XCTAssertLessThan(req.body.count, payload.count)
+        XCTAssertEqual(try gunzip(req.body), payload)
+        let stats = transport.stats()
+        XCTAssertEqual(stats.compressedPayloads, 1)
+        XCTAssertEqual(stats.uncompressedPayloads, 0)
+        XCTAssertGreaterThan(stats.compressionBytesSaved, 0)
+        #else
+        throw XCTSkip("Compression framework is unavailable on this platform")
+        #endif
     }
 
     // MARK: retry then persist (network errors)
@@ -329,5 +406,35 @@ final class TransportTests: XCTestCase {
         DispatchQueue.global().asyncAfter(deadline: .now() + 0.2) { settle.fulfill() }
         wait(for: [settle], timeout: 2)
         XCTAssertEqual(spool.count(), 0, "session lifecycle paths are never spooled")
+    }
+
+    private func gunzip(_ data: Data) throws -> Data {
+        #if canImport(Compression)
+        let bytes = [UInt8](data)
+        XCTAssertGreaterThanOrEqual(bytes.count, 18)
+        XCTAssertEqual(bytes[0], 0x1f)
+        XCTAssertEqual(bytes[1], 0x8b)
+        XCTAssertEqual(bytes[2], 0x08)
+        XCTAssertEqual(bytes[3], 0x00)
+        let expectedSize =
+            Int(bytes[bytes.count - 4]) |
+            (Int(bytes[bytes.count - 3]) << 8) |
+            (Int(bytes[bytes.count - 2]) << 16) |
+            (Int(bytes[bytes.count - 1]) << 24)
+        let compressed = Array(bytes[10..<(bytes.count - 8)])
+        var output = [UInt8](repeating: 0, count: expectedSize)
+        let written = compressed.withUnsafeBufferPointer { src in
+            output.withUnsafeMutableBufferPointer { dst in
+                guard let srcBase = src.baseAddress, let dstBase = dst.baseAddress else { return 0 }
+                return compression_decode_buffer(dstBase, dst.count,
+                                                 srcBase, src.count,
+                                                 nil, COMPRESSION_ZLIB)
+            }
+        }
+        XCTAssertEqual(written, expectedSize)
+        return Data(output.prefix(written))
+        #else
+        return data
+        #endif
     }
 }

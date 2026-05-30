@@ -40,16 +40,17 @@ public final class AllStakClient: @unchecked Sendable {
     /// Ingest paths reused across senders.
     static let pathErrors = "/ingest/v1/errors"
     static let pathReleases = "/ingest/v1/releases"
+    static let pathSpans = "/ingest/v1/spans"
 
     /// PII-scrubbing config. When `sendDefaultPii` is `false` (default) the
     /// email/IPv4 value scrubbers run in addition to the always-on
     /// credit-card + SSN scrubbers and the key denylist.
     private let sanitizer: Sanitizer
 
-    /// Final, in-process filter run at the wire chokepoint BEFORE any POST and
-    /// BEFORE the sanitizer. Returning `nil` drops the event; the closure may
-    /// mutate the event. Sees real (un-scrubbed) data so a caller can inspect it;
-    /// the wire payload is always scrubbed afterwards.
+    /// Final, in-process filter run at the wire chokepoint after a first
+    /// sanitizer pass. Returning `nil` drops the event; the closure may mutate
+    /// the sanitized event. The wire payload is scrubbed again afterwards so a
+    /// hook cannot reintroduce secrets.
     private let beforeSend: (@Sendable (AllStakErrorEvent) -> AllStakErrorEvent?)?
 
     /// Release-health session tracker. `nil` when `enableAutoSessionTracking` is
@@ -79,6 +80,8 @@ public final class AllStakClient: @unchecked Sendable {
     /// The global scope shared across this client. Breadcrumbs / user / tags /
     /// contexts / extra accumulated here are attached to every captured event.
     let scope = Scope()
+    private let diagnosticsLock = NSLock()
+    private var capturedEvents = 0
 
     /// - Parameters:
     ///   - release: explicit release; when `nil`/empty and `autoDetectRelease`
@@ -189,6 +192,50 @@ public final class AllStakClient: @unchecked Sendable {
                         addresses: addresses, scope: scope))
     }
 
+    /// Capture one completed span through the same reliable transport used for
+    /// errors. Identifiers are normalized to W3C shape before encoding.
+    public func captureSpan(traceId: String,
+                            spanId: String,
+                            parentSpanId: String? = nil,
+                            operation: String,
+                            description: String? = nil,
+                            status: String = "ok",
+                            durationMs: Int,
+                            startTimeMillis: Int64,
+                            endTimeMillis: Int64,
+                            service: String? = nil,
+                            tags: [String: Any]? = nil,
+                            data: String? = nil,
+                            attributes: [String: Any]? = nil) {
+        guard !apiKey.isEmpty else { return }
+        let safeTags = tags.map { sanitizer.sanitizeStringValueMap($0.asJSONValueMap()) }
+        let safeAttributes = attributes.map { sanitizer.sanitizeStringValueMap($0.asJSONValueMap()) }
+        let span = AllStakSpan(
+            traceId: traceId,
+            spanId: spanId,
+            parentSpanId: parentSpanId,
+            operation: operation,
+            description: description.map { sanitizer.scrubString($0) },
+            status: status,
+            durationMs: durationMs,
+            startTimeMillis: startTimeMillis,
+            endTimeMillis: endTimeMillis,
+            service: service ?? Self.sdkName,
+            environment: environment,
+            tags: safeTags,
+            data: data.map { sanitizer.scrubString($0) },
+            release: release,
+            sessionId: sessionTracker?.currentSessionId,
+            op: operation,
+            platform: "cocoa",
+            attributes: safeAttributes)
+        guard let body = try? JSONEncoder().encode(AllStakSpanBatch(spans: [span])) else {
+            transport.recordDropped()
+            return
+        }
+        transport.send(path: Self.pathSpans, body: body)
+    }
+
     // MARK: - Scope API (global scope)
     //
     // Thin delegations to the global ``scope``; the validation / locking lives
@@ -268,6 +315,41 @@ public final class AllStakClient: @unchecked Sendable {
         guard !apiKey.isEmpty else { return }
         Self.postJSON(transport: transport, path: SessionTracker.pathEnd,
                       body: ["sessionId": sessionId, "durationMs": durationMs, "status": status])
+    }
+
+    func diagnostics() -> AllStakDiagnostics {
+        let transportStats = transport.stats()
+        let snapshot = scope.snapshot()
+        return AllStakDiagnostics(
+            eventsCaptured: capturedEventCount(),
+            eventsSent: transportStats.eventsSent,
+            eventsFailed: transportStats.eventsFailed,
+            eventsDropped: transportStats.eventsDropped,
+            eventsPersisted: transportStats.eventsPersisted,
+            eventsReplayed: transportStats.eventsReplayed,
+            queueSize: transportStats.queueSize,
+            retryAttempts: transportStats.retryAttempts,
+            rateLimitedCount: transportStats.rateLimitedCount,
+            compressedPayloads: transportStats.compressedPayloads,
+            uncompressedPayloads: transportStats.uncompressedPayloads,
+            compressionBytesSaved: transportStats.compressionBytesSaved,
+            sanitizerRedactionCount: nil,
+            activeTraceCount: 1,
+            activeSpanCount: 0,
+            breadcrumbCount: snapshot.breadcrumbs.count,
+            sessionRecoveryCount: sessionTracker?.recoveryCount ?? 0,
+            disabled: transportStats.disabled)
+    }
+
+    func flush(timeout: TimeInterval = 5) async -> Bool {
+        await transport.flush(timeout: timeout)
+    }
+
+    func close(timeout: TimeInterval = 5) async -> Bool {
+        appHangDetector?.stop()
+        appHangDetector = nil
+        endSession()
+        return await flush(timeout: timeout)
     }
 
     // visible for testing — pure payload construction, no network. When `scope`
@@ -437,9 +519,11 @@ public final class AllStakClient: @unchecked Sendable {
     /// is settled (it will never become sendable). Fail-open.
     func flushCrash(_ report: CrashReport, images: [AllStakBinaryImage],
                     onResolved: @escaping @Sendable (Transport.Resolution) -> Void) {
+        recordCapturedEvent()
         let event = buildCrashEvent(report, images: images)
         guard let body = scrubbedBody(event) else {
             // Dropped by beforeSend or unencodable → never sendable; clear source.
+            transport.recordDropped()
             onResolved(.settled)
             return
         }
@@ -449,7 +533,7 @@ public final class AllStakClient: @unchecked Sendable {
     /// The single scrub point on the wire path. Visible for testing. Tries the
     /// full sanitizer first; if it raises for any reason, falls back to a
     /// key-only redaction (still removes the highest-risk secrets) so a scrubber
-    /// bug never drops telemetry. Worst case the original event is returned.
+    /// bug never drops telemetry. Worst case a minimal redacted event is returned.
     func sanitizedForWire(_ event: AllStakErrorEvent) -> AllStakErrorEvent {
         let result = Result { sanitizer.sanitize(event) }
         switch result {
@@ -457,30 +541,70 @@ public final class AllStakClient: @unchecked Sendable {
             return scrubbed
         case .failure:
             // Fail-open: degrade to key-only redaction rather than dropping.
-            return (try? sanitizer.keyOnlyRedaction(event)) ?? event
+            return (try? sanitizer.keyOnlyRedaction(event)) ?? redactedFallbackEvent(event)
         }
     }
 
+    private func redactedFallbackEvent(_ event: AllStakErrorEvent) -> AllStakErrorEvent {
+        let copy = AllStakErrorEvent(
+            exceptionClass: event.exceptionClass,
+            message: Sanitizer.redactedMarker,
+            level: event.level,
+            platform: event.platform,
+            environment: event.environment,
+            release: event.release,
+            sessionId: event.sessionId,
+            frames: event.frames,
+            debugMeta: event.debugMeta,
+            sdkName: event.sdkName,
+            sdkVersion: event.sdkVersion,
+            timestamp: event.timestamp,
+            mechanism: event.mechanism,
+            breadcrumbs: nil,
+            user: event.user,
+            tags: nil,
+            contexts: nil,
+            extra: ["redacted": .bool(true)],
+            fingerprint: event.fingerprint)
+        return copy
+    }
+
     private func send(_ rawEvent: AllStakErrorEvent) {
-        guard let body = scrubbedBody(rawEvent) else { return } // dropped by beforeSend / unencodable
+        recordCapturedEvent()
+        guard let body = scrubbedBody(rawEvent) else {
+            transport.recordDropped()
+            return
+        } // dropped by beforeSend / unencodable
         transport.send(path: Self.pathErrors, body: body)
+    }
+
+    private func recordCapturedEvent() {
+        diagnosticsLock.lock()
+        capturedEvents += 1
+        diagnosticsLock.unlock()
+    }
+
+    private func capturedEventCount() -> Int {
+        diagnosticsLock.lock()
+        defer { diagnosticsLock.unlock() }
+        return capturedEvents
     }
 
     /// Produce the exact ALREADY-SCRUBBED bytes that would be POSTed for an event,
     /// or `nil` when `beforeSend` drops it or encoding fails. Visible for the
     /// crash-flush path so a crash report can be persisted as scrubbed bytes.
     ///
-    /// 1. `beforeSend` runs FIRST on the real (un-scrubbed) data — it may mutate
-    ///    or drop the event (`nil`). 2. The sanitizer runs AFTER so the wire
-    ///    payload is always scrubbed (fail-open to key-only redaction).
+    /// 1. The sanitizer runs before `beforeSend`, so hooks see sanitized data.
+    /// 2. `beforeSend` may mutate or drop the event (`nil`). 3. The sanitizer
+    ///    runs again so the wire payload is always scrubbed (fail-open to
+    ///    key-only or minimal redaction).
     func scrubbedBody(_ rawEvent: AllStakErrorEvent) -> Data? {
-        var event = rawEvent
+        var event = sanitizedForWire(rawEvent)
         if let beforeSend {
             guard let filtered = beforeSend(event) else { return nil } // dropped
-            event = filtered
+            event = sanitizedForWire(filtered)
         }
-        let wireEvent = sanitizedForWire(event)
-        return try? JSONEncoder().encode(wireEvent)
+        return try? JSONEncoder().encode(event)
     }
 
     /// JSON POST through the reliable ``Transport`` (retry/backoff/Retry-After/

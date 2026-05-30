@@ -39,8 +39,19 @@ enum TracePropagation {
     private static func normalizeHex(_ value: String, width: Int) -> String {
         let hex = value.lowercased().filter { $0.isHexDigit }
         let truncated = String(hex.prefix(width))
-        if truncated.count >= width { return truncated }
-        return truncated + String(repeating: "0", count: width - truncated.count)
+        let candidate = truncated.count >= width
+            ? truncated
+            : truncated + String(repeating: "0", count: width - truncated.count)
+        if candidate.count == width && !candidate.allSatisfy({ $0 == "0" }) {
+            return candidate
+        }
+        let generated = UUID().uuidString
+            .lowercased()
+            .filter { $0.isHexDigit }
+        let fallback = String(generated.prefix(width))
+        return fallback.allSatisfy({ $0 == "0" })
+            ? "1" + String(fallback.dropFirst())
+            : fallback
     }
 
     /// Compute the propagation header values for a trace. A fresh span id is

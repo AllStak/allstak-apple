@@ -143,6 +143,7 @@ final class SessionTracker: @unchecked Sendable {
     private let lock = NSLock()
     private var active: Session?
     private var ended = false
+    private var recoveredSessions = 0
 
     private static let stateVersion = 1
     private static let stateMaxAge: TimeInterval = 7 * 24 * 60 * 60
@@ -208,6 +209,11 @@ final class SessionTracker: @unchecked Sendable {
     var currentSessionId: String? {
         lock.lock(); defer { lock.unlock() }
         return ended ? nil : active?.id
+    }
+
+    var recoveryCount: Int {
+        lock.lock(); defer { lock.unlock() }
+        return recoveredSessions
     }
 
     /// Record a handled error against the active session. No I/O.
@@ -296,6 +302,9 @@ final class SessionTracker: @unchecked Sendable {
         state["recoveredAt"] = now.timeIntervalSince1970 * 1000
         state["recoveryLockUntil"] = 0
         store.write(state)
+        lock.lock()
+        recoveredSessions += 1
+        lock.unlock()
     }
 
     private func writeOpenState(_ session: Session, userId: String?) {

@@ -72,9 +72,9 @@ public enum AllStak {
     ///   `false` to opt out; the existing automatic HTTP breadcrumb source is
     ///   unaffected.
     /// - Parameter beforeSend: a final filter run on every event at the wire
-    ///   chokepoint, BEFORE PII scrubbing. Return `nil` to drop the event, or a
-    ///   (possibly mutated) event to send. The hook sees real, un-scrubbed data;
-    ///   the wire payload is always scrubbed afterwards.
+    ///   chokepoint after a first PII-scrubbing pass. Return `nil` to drop the
+    ///   event, or a (possibly mutated) sanitized event to send. The wire payload
+    ///   is scrubbed again afterwards, so hooks cannot reintroduce secrets.
     /// - Parameter enableAppHangTracking: when `true` (default) a background
     ///   watchdog pings the main run loop and records an `App Hanging` warning
     ///   event (`app_hang` mechanism) if the main thread is unresponsive for
@@ -272,6 +272,38 @@ public enum AllStak {
         current()?.capture(message: message, level: level)
     }
 
+    /// Capture one completed span. This is a low-level API for custom
+    /// instrumentation; automatic URLSession instrumentation continues to
+    /// propagate W3C trace headers independently.
+    public static func captureSpan(traceId: String,
+                                   spanId: String,
+                                   parentSpanId: String? = nil,
+                                   operation: String,
+                                   description: String? = nil,
+                                   status: String = "ok",
+                                   durationMs: Int,
+                                   startTimeMillis: Int64,
+                                   endTimeMillis: Int64,
+                                   service: String? = nil,
+                                   tags: [String: Any]? = nil,
+                                   data: String? = nil,
+                                   attributes: [String: Any]? = nil) {
+        current()?.captureSpan(
+            traceId: traceId,
+            spanId: spanId,
+            parentSpanId: parentSpanId,
+            operation: operation,
+            description: description,
+            status: status,
+            durationMs: durationMs,
+            startTimeMillis: startTimeMillis,
+            endTimeMillis: endTimeMillis,
+            service: service,
+            tags: tags,
+            data: data,
+            attributes: attributes)
+    }
+
     // MARK: - Scope
 
     /// Record a breadcrumb on the global scope. Breadcrumbs are a FIFO ring
@@ -334,6 +366,55 @@ public enum AllStak {
     public static func withScope<T>(_ body: (Scope) throws -> T) rethrows -> T? {
         guard let client = current() else { return nil }
         return try client.withScope(body)
+    }
+
+    public static func getDiagnostics() -> AllStakDiagnostics {
+        current()?.diagnostics() ?? AllStakDiagnostics()
+    }
+
+    /// Wait for currently in-flight SDK transport work to settle.
+    ///
+    /// Returns `false` when the hard timeout expires. The SDK never throws into
+    /// the host app; timed-out sends continue in the background and may still be
+    /// accepted or persisted by the reliable transport.
+    @discardableResult
+    public static func flush(timeout: TimeInterval = 5) async -> Bool {
+        guard let c = current() else { return true }
+        return await c.flush(timeout: timeout)
+    }
+
+    /// End the release-health session, detach automatic instrumentation, and
+    /// flush pending telemetry with a hard timeout. Idempotent.
+    @discardableResult
+    public static func close(timeout: TimeInterval = 5) async -> Bool {
+        let (c, observers) = takeClientForClose()
+
+        for observer in observers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        HTTPInstrumentation.shared.disable()
+        AutoBreadcrumbs.shared.disable()
+
+        guard let c else { return true }
+        CrashStore.defaultStore().clearOpenSession()
+        c.watchdogTracker?.clear()
+        #if canImport(MetricKit) && !os(tvOS)
+        if #available(iOS 14.0, macOS 12.0, *) {
+            (c.metricKitSubscriber as? MetricKitSubscriber)?.unsubscribe()
+        }
+        #endif
+        c.metricKitSubscriber = nil
+        return await c.close(timeout: timeout)
+    }
+
+    private static func takeClientForClose() -> (AllStakClient?, [NSObjectProtocol]) {
+        lock.lock()
+        defer { lock.unlock() }
+        let c = client
+        client = nil
+        let observers = lifecycleObservers
+        lifecycleObservers = []
+        return (c, observers)
     }
 
     private static func current() -> AllStakClient? {

@@ -349,4 +349,16 @@ final class HTTPInstrumentationTests: XCTestCase {
         let uuid = UUID().uuidString
         XCTAssertEqual(TracePropagation.normalizeTraceId(uuid).count, 32)
     }
+
+    func testNormalizeIdsRejectAllZeroAndNonHexValues() {
+        let zeroTrace = TracePropagation.normalizeTraceId(String(repeating: "0", count: 32))
+        XCTAssertEqual(zeroTrace.count, 32)
+        XCTAssertNotEqual(zeroTrace, String(repeating: "0", count: 32))
+        XCTAssertTrue(zeroTrace.allSatisfy { $0.isHexDigit })
+
+        let invalidSpan = TracePropagation.normalizeSpanId("not-a-span")
+        XCTAssertEqual(invalidSpan.count, 16)
+        XCTAssertNotEqual(invalidSpan, String(repeating: "0", count: 16))
+        XCTAssertTrue(invalidSpan.allSatisfy { $0.isHexDigit })
+    }
 }

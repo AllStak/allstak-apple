@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Compression)
+import Compression
+#endif
 
 /// Minimal async POST seam so the ``Transport`` can be driven by a real
 /// `URLSession` in production and a deterministic stub in tests, without the
@@ -30,6 +33,27 @@ struct URLSessionPoster: HTTPPoster {
         }
         let retryAfter = http.value(forHTTPHeaderField: "Retry-After")
         return (http.statusCode, retryAfter)
+    }
+}
+
+private final class FlushRace: @unchecked Sendable {
+    private let lock = NSLock()
+    private var didResume = false
+    private let continuation: CheckedContinuation<Bool, Never>
+
+    init(_ continuation: CheckedContinuation<Bool, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume(_ value: Bool) {
+        lock.lock()
+        guard !didResume else {
+            lock.unlock()
+            return
+        }
+        didResume = true
+        lock.unlock()
+        continuation.resume(returning: value)
     }
 }
 
@@ -65,6 +89,10 @@ final class Transport: @unchecked Sendable {
     private let lock = NSLock()
     /// Set once a 401 is seen — every subsequent send is a silent no-op.
     private var disabled = false
+    private let statsLock = NSLock()
+    private var statsSnapshot = TransportStats()
+    private let inflightLock = NSLock()
+    private var inflightTasks: [UUID: Task<Void, Never>] = [:]
 
     init(baseURL: String,
          apiKey: String,
@@ -95,6 +123,59 @@ final class Transport: @unchecked Sendable {
         lock.lock(); disabled = true; lock.unlock()
     }
 
+    func stats() -> TransportStats {
+        statsLock.lock()
+        var snapshot = statsSnapshot
+        statsLock.unlock()
+        snapshot.queueSize = spool?.count() ?? 0
+        snapshot.disabled = isDisabled
+        return snapshot
+    }
+
+    func recordDropped() {
+        incrementStat { $0.eventsDropped += 1 }
+    }
+
+    private func recordSent(replay: Bool) {
+        incrementStat {
+            $0.eventsSent += 1
+            if replay { $0.eventsReplayed += 1 }
+        }
+    }
+
+    private func recordFailed() {
+        incrementStat { $0.eventsFailed += 1 }
+    }
+
+    private func recordPersisted() {
+        incrementStat { $0.eventsPersisted += 1 }
+    }
+
+    private func recordRetryAttempt() {
+        incrementStat { $0.retryAttempts += 1 }
+    }
+
+    private func recordRateLimited() {
+        incrementStat { $0.rateLimitedCount += 1 }
+    }
+
+    private func recordCompression(compressed: Bool, bytesSaved: Int) {
+        incrementStat {
+            if compressed {
+                $0.compressedPayloads += 1
+                $0.compressionBytesSaved += max(0, bytesSaved)
+            } else {
+                $0.uncompressedPayloads += 1
+            }
+        }
+    }
+
+    private func incrementStat(_ update: (inout TransportStats) -> Void) {
+        statsLock.lock()
+        update(&statsSnapshot)
+        statsLock.unlock()
+    }
+
     /// Final disposition of one delivery, surfaced to the crash-flush caller so it
     /// knows whether the on-disk `.crash` file may be removed.
     enum Resolution: Equatable {
@@ -112,9 +193,12 @@ final class Transport: @unchecked Sendable {
     /// retry/backoff/persist pipeline. A blank API key (transport effectively
     /// off) and a disabled SDK both short-circuit to a no-op.
     func send(path: String, body: Data) {
-        guard !apiKey.isEmpty, !isDisabled else { return }
-        Task.detached { [weak self] in
-            await self?.deliver(path: path, body: body, persistId: nil)
+        guard !apiKey.isEmpty, !isDisabled else {
+            recordDropped()
+            return
+        }
+        trackTask { transport in
+            _ = await transport.deliver(path: path, body: body, persistId: nil)
         }
     }
 
@@ -126,17 +210,38 @@ final class Transport: @unchecked Sendable {
         guard let spool, !apiKey.isEmpty, !isDisabled else { return }
         let entries = spool.load()
         guard !entries.isEmpty else { return }
-        Task.detached { [weak self] in
-            guard let self else { return }
+        trackTask { transport in
             for entry in entries {
-                if self.isDisabled { break }
+                if transport.isDisabled { break }
                 // Defensive: never replay a session lifecycle call even if one
                 // leaked into the spool from an older SDK version.
                 guard isPersistablePath(entry.path), let payload = entry.payload else {
                     spool.remove(id: entry.id)
                     continue
                 }
-                await self.deliver(path: entry.path, body: payload, persistId: entry.id)
+                _ = await transport.deliver(path: entry.path, body: payload, persistId: entry.id)
+            }
+        }
+    }
+
+    /// Wait for currently in-flight sends/replays to settle, bounded by
+    /// `timeout`. A timeout returns `false` but does not cancel delivery tasks:
+    /// they may still complete or persist their scrubbed payloads.
+    func flush(timeout: TimeInterval = 5) async -> Bool {
+        let tasks = snapshotInflightTasks()
+        guard !tasks.isEmpty else { return true }
+        return await withCheckedContinuation { continuation in
+            let race = FlushRace(continuation)
+            Task.detached {
+                for task in tasks { await task.value }
+                race.resume(true)
+            }
+            Task.detached {
+                let nanos = UInt64(max(0, timeout) * 1_000_000_000)
+                if nanos > 0 {
+                    try? await Task.sleep(nanoseconds: nanos)
+                }
+                race.resume(false)
             }
         }
     }
@@ -147,8 +252,13 @@ final class Transport: @unchecked Sendable {
     /// refused by the spool itself. Fail-open.
     @discardableResult
     func persistNow(path: String, body: Data) -> Bool {
-        guard let spool else { return false }
-        return spool.enqueue(path: path, payload: body)
+        guard let spool else {
+            recordDropped()
+            return false
+        }
+        let persisted = spool.enqueue(path: path, payload: body)
+        if persisted { recordPersisted() } else { recordDropped() }
+        return persisted
     }
 
     /// Flush a crash report recorded on a PREVIOUS launch through the transport.
@@ -164,11 +274,35 @@ final class Transport: @unchecked Sendable {
     ///     bug. Runs detached; never blocks launch.
     func flushCrash(path: String, body: Data, onResolved: @escaping @Sendable (Resolution) -> Void) {
         guard !apiKey.isEmpty, !isDisabled else { onResolved(.keepSource); return }
-        Task.detached { [weak self] in
-            guard let self else { onResolved(.keepSource); return }
-            let resolution = await self.deliver(path: path, body: body, persistId: nil)
+        trackTask { transport in
+            let resolution = await transport.deliver(path: path, body: body, persistId: nil)
             onResolved(resolution)
         }
+    }
+
+    private func trackTask(_ operation: @escaping @Sendable (Transport) async -> Void) {
+        let id = UUID()
+        inflightLock.lock()
+        let task = Task.detached { [weak self] in
+            guard let self else { return }
+            await operation(self)
+            self.removeInflightTask(id)
+        }
+        inflightTasks[id] = task
+        inflightLock.unlock()
+    }
+
+    private func removeInflightTask(_ id: UUID) {
+        inflightLock.lock()
+        inflightTasks.removeValue(forKey: id)
+        inflightLock.unlock()
+    }
+
+    private func snapshotInflightTasks() -> [Task<Void, Never>] {
+        inflightLock.lock()
+        let tasks = Array(inflightTasks.values)
+        inflightLock.unlock()
+        return tasks
     }
 
     // MARK: - Delivery pipeline (async, fail-open)
@@ -181,39 +315,53 @@ final class Transport: @unchecked Sendable {
     private func deliver(path: String, body: Data, persistId: String?) async -> Resolution {
         guard !apiKey.isEmpty, !isDisabled else { return .keepSource }
         guard let url = URL(string: baseURL + path) else { return .keepSource }
-        let headers = [
+        let prepared = prepareRequestBody(body)
+        var headers = [
             "Content-Type": "application/json",
             "X-AllStak-Key": apiKey,
         ]
+        if let contentEncoding = prepared.contentEncoding {
+            headers["Content-Encoding"] = contentEncoding
+        }
+        recordCompression(compressed: prepared.contentEncoding != nil,
+                          bytesSaved: body.count - prepared.body.count)
 
         var attemptIndex = 0
         while true {
-            let outcome = await runAttempt(url: url, headers: headers, body: body)
+            let outcome = await runAttempt(url: url, headers: headers, body: prepared.body)
             switch outcome {
             case .accepted:
+                recordSent(replay: persistId != nil)
                 if let persistId { spool?.remove(id: persistId) }
                 return .settled
             case .unauthorized:
+                recordFailed()
+                recordDropped()
                 markDisabled()
                 if let persistId { spool?.remove(id: persistId) }
                 // A 401 is terminal for the SDK; the crash record can be cleared
                 // (replaying it would only hit the same disabled key).
                 return .settled
             case .permanent:
+                recordFailed()
+                recordDropped()
                 if let persistId { spool?.remove(id: persistId) }
                 return .settled
             case .retryable(let retryAfterSeconds):
                 if attemptIndex >= RetryPolicy.maxRetries {
+                    recordFailed()
                     // Retries exhausted → hand to the persistent spool (skip
                     // session paths). A replay re-persists under its own id.
                     let persisted = persistOnExhaustion(path: path, body: body, persistId: persistId)
                     // If we managed to spool it (or it was already a spool replay),
                     // the source may be cleared — the spool now owns retry. If we
                     // could NOT persist, tell the caller to keep its source.
+                    if !persisted && persistId == nil { recordDropped() }
                     return (persisted || persistId != nil) ? .settled : .keepSource
                 }
                 let backoff = RetryPolicy.backoffSeconds(attempt: attemptIndex, randomUnit: randomUnit)
                 let delay = retryAfterSeconds > 0 ? retryAfterSeconds : backoff
+                recordRetryAttempt()
                 await sleep(delay)
                 attemptIndex += 1
                 if isDisabled { return .keepSource }
@@ -226,6 +374,7 @@ final class Transport: @unchecked Sendable {
     private func runAttempt(url: URL, headers: [String: String], body: Data) async -> RetryPolicy.Outcome {
         do {
             let (status, retryAfter) = try await poster.post(url: url, headers: headers, body: body)
+            if status == 429 { recordRateLimited() }
             return RetryPolicy.classify(status: status, retryAfter: retryAfter)
         } catch {
             return RetryPolicy.classify(status: nil, retryAfter: nil) // network error → retry
@@ -240,10 +389,74 @@ final class Transport: @unchecked Sendable {
     @discardableResult
     private func persistOnExhaustion(path: String, body: Data, persistId: String?) -> Bool {
         guard let spool else { return false }
+        let persisted: Bool
         if let persistId {
-            return spool.enqueue(SpooledEnvelope(id: persistId, path: path, payload: body))
+            persisted = spool.enqueue(SpooledEnvelope(id: persistId, path: path, payload: body))
         } else {
-            return spool.enqueue(path: path, payload: body)
+            persisted = spool.enqueue(path: path, payload: body)
         }
+        if persisted { recordPersisted() }
+        return persisted
+    }
+
+    private struct PreparedBody {
+        var body: Data
+        var contentEncoding: String?
+    }
+
+    private func prepareRequestBody(_ body: Data) -> PreparedBody {
+        guard body.count >= Self.compressionThresholdBytes,
+              let compressed = Self.gzipCompress(body),
+              compressed.count < body.count else {
+            return PreparedBody(body: body, contentEncoding: nil)
+        }
+        return PreparedBody(body: compressed, contentEncoding: "gzip")
+    }
+
+    private static let compressionThresholdBytes = 1024
+
+    private static func gzipCompress(_ body: Data) -> Data? {
+        #if canImport(Compression)
+        guard !body.isEmpty else { return nil }
+        let source = [UInt8](body)
+        var deflated = [UInt8](repeating: 0,
+                               count: body.count + max(512, body.count / 16))
+        let written = source.withUnsafeBufferPointer { src in
+            deflated.withUnsafeMutableBufferPointer { dst in
+                guard let srcBase = src.baseAddress, let dstBase = dst.baseAddress else { return 0 }
+                return compression_encode_buffer(dstBase, dst.count,
+                                                 srcBase, src.count,
+                                                 nil, COMPRESSION_ZLIB)
+            }
+        }
+        guard written > 0 else { return nil }
+
+        var gzip = Data([0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff])
+        gzip.append(contentsOf: deflated.prefix(written))
+        appendLittleEndianUInt32(crc32(body), to: &gzip)
+        appendLittleEndianUInt32(UInt32(truncatingIfNeeded: body.count), to: &gzip)
+        return gzip
+        #else
+        return nil
+        #endif
+    }
+
+    private static func appendLittleEndianUInt32(_ value: UInt32, to data: inout Data) {
+        data.append(UInt8(value & 0xff))
+        data.append(UInt8((value >> 8) & 0xff))
+        data.append(UInt8((value >> 16) & 0xff))
+        data.append(UInt8((value >> 24) & 0xff))
+    }
+
+    private static func crc32(_ data: Data) -> UInt32 {
+        var crc: UInt32 = 0xffff_ffff
+        for byte in data {
+            crc ^= UInt32(byte)
+            for _ in 0..<8 {
+                let mask = UInt32(bitPattern: Int32(-Int32(crc & 1)))
+                crc = (crc >> 1) ^ (0xedb8_8320 & mask)
+            }
+        }
+        return crc ^ 0xffff_ffff
     }
 }

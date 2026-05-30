@@ -249,34 +249,35 @@ final class SanitizerTests: XCTestCase {
         XCTAssertTrue(dropped.value, "beforeSend must run before send")
     }
 
-    func testBeforeSendMutateIsSeenBeforeScrubbing() {
-        // beforeSend sees the real message and can mutate it; the sanitizer then
-        // scrubs whatever beforeSend produced.
-        let s = Sanitizer(sendDefaultPii: false)
-        let original = AllStakErrorEvent(
-            exceptionClass: "E", message: "card 4242424242424242", level: "error",
-            platform: "cocoa", environment: nil, release: nil, sessionId: nil,
-            frames: [], debugMeta: AllStakDebugMeta(images: []),
-            sdkName: "x", sdkVersion: "y", timestamp: 0)
-
-        // Simulate the send() pipeline ordering: beforeSend first, sanitizer after.
-        let beforeSend: (AllStakErrorEvent) -> AllStakErrorEvent? = { ev in
-            // The hook SEES the raw (un-scrubbed) card number.
-            XCTAssertEqual(ev.message, "card 4242424242424242")
+    func testBeforeSendReceivesSanitizedEventAndCannotReintroduceSecrets() throws {
+        let seen = LockedEvent()
+        let c = client(beforeSend: { ev in
+            seen.set(ev)
             var copy = AllStakErrorEvent(
                 exceptionClass: ev.exceptionClass, message: "mutated 5555555555554444",
                 level: ev.level, platform: ev.platform, environment: ev.environment,
                 release: ev.release, sessionId: ev.sessionId, frames: ev.frames,
                 debugMeta: ev.debugMeta, sdkName: ev.sdkName, sdkVersion: ev.sdkVersion,
-                timestamp: ev.timestamp)
+                timestamp: ev.timestamp,
+                extra: ["token": .string("secret-token")])
             copy.tags = ["env": "prod"]
             return copy
-        }
-        guard let mutated = beforeSend(original) else { return XCTFail("must not drop") }
-        let scrubbed = s.sanitize(mutated)
-        // beforeSend's mutation is present, AND its (Luhn-valid) card is scrubbed.
-        XCTAssertEqual(scrubbed.message, "mutated \(R)")
-        XCTAssertEqual(scrubbed.tags?["env"], "prod")
+        })
+        var original = AllStakErrorEvent(
+            exceptionClass: "E", message: "card 4242424242424242", level: "error",
+            platform: "cocoa", environment: nil, release: nil, sessionId: nil,
+            frames: [], debugMeta: AllStakDebugMeta(images: []),
+            sdkName: "x", sdkVersion: "y", timestamp: 0)
+        original.extra = ["Authorization": .string("Bearer abc")]
+
+        let body = try XCTUnwrap(c.scrubbedBody(original))
+        let wire = try JSONDecoder().decode(AllStakErrorEvent.self, from: body)
+
+        XCTAssertEqual(seen.value?.message, "card \(R)")
+        XCTAssertEqual(seen.value?.extra?["Authorization"], .string(R))
+        XCTAssertEqual(wire.message, "mutated \(R)")
+        XCTAssertEqual(wire.extra?["token"], .string(R))
+        XCTAssertEqual(wire.tags?["env"], "prod")
     }
 
     // MARK: fail-open
@@ -317,4 +318,11 @@ private final class LockedFlag: @unchecked Sendable {
     private var _v = false
     func set() { lock.lock(); _v = true; lock.unlock() }
     var value: Bool { lock.lock(); defer { lock.unlock() }; return _v }
+}
+
+private final class LockedEvent: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _value: AllStakErrorEvent?
+    func set(_ value: AllStakErrorEvent) { lock.lock(); _value = value; lock.unlock() }
+    var value: AllStakErrorEvent? { lock.lock(); defer { lock.unlock() }; return _value }
 }
