@@ -330,6 +330,9 @@ enum SignalCrashHandler {
     /// handler. Called from normal context at launch.
     static func install(crashFileURL: URL) {
         // 1. Alternate signal stack (a faulting stack may be unusable).
+        //    `sigaltstack` is unavailable on tvOS, so the alt-stack is skipped
+        //    there; handlers still install and run on the normal stack.
+        #if !os(tvOS)
         let stackSize = max(Int(SIGSTKSZ), 64 * 1024)
         let stack = UnsafeMutableRawPointer.allocate(byteCount: stackSize,
                                                      alignment: MemoryLayout<UInt>.alignment)
@@ -339,6 +342,7 @@ enum SignalCrashHandler {
         ss.ss_size = stackSize
         ss.ss_flags = 0
         _ = sigaltstack(&ss, nil)
+        #endif
 
         // 2. Pre-allocate the buffers the handler fills.
         g_recordBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: SignalCrashRecord.maxRecordSize)
@@ -367,7 +371,12 @@ enum SignalCrashHandler {
         for sig in g_allstakSignals {
             var action = SigAction()
             action.__sigaction_u.__sa_sigaction = allstakSignalHandler
+            #if os(tvOS)
+            // No alternate stack on tvOS (no sigaltstack) — omit SA_ONSTACK.
+            action.sa_flags = SA_SIGINFO
+            #else
             action.sa_flags = SA_SIGINFO | SA_ONSTACK
+            #endif
             sigemptyset(&action.sa_mask)
             var old = SigAction()
             if sigaction(sig, &action, &old) == 0 {
