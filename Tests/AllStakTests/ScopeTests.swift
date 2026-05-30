@@ -1,7 +1,7 @@
 import XCTest
 @testable import AllStak
 
-/// Sentry-cocoa-style scope: breadcrumb ring buffer (cap + FIFO), user / tags /
+/// Scoped context: breadcrumb ring buffer (cap + FIFO), user / tags /
 /// context attach to events, `withScope` isolation, JSON omit-when-empty so the
 /// existing wire shape is preserved, and Codable round-trips for the scope-bearing
 /// `AllStakErrorEvent` (incl. the `JSONValue` helper).

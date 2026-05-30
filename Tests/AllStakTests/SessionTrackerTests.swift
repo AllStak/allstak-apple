@@ -19,7 +19,26 @@ final class SessionTrackerTests: XCTestCase {
         }
     }
 
+    private final class MemoryStore: SessionStateStore {
+        private let lock = NSLock()
+        private var state: [String: Any]?
+        init(_ initial: [String: Any]? = nil) {
+            self.state = initial
+        }
+        func read() -> [String: Any]? {
+            lock.lock(); defer { lock.unlock() }
+            return state
+        }
+        func write(_ state: [String: Any]) {
+            lock.lock(); self.state = state; lock.unlock()
+        }
+        func clear() {
+            lock.lock(); state = nil; lock.unlock()
+        }
+    }
+
     private func makeTracker(transportEnabled: Bool = true,
+                             store: SessionStateStore? = nil,
                              recorder: Recorder) -> SessionTracker {
         SessionTracker(
             release: "1.2.3",
@@ -28,6 +47,7 @@ final class SessionTrackerTests: XCTestCase {
             sdkVersion: "0.1.0",
             platform: "cocoa",
             transportEnabled: transportEnabled,
+            stateStore: store,
             sender: { path, body in recorder.record(path, body) })
     }
 
@@ -157,6 +177,76 @@ final class SessionTrackerTests: XCTestCase {
         let tracker = makeTracker(recorder: rec)
         tracker.end()
         XCTAssertTrue(rec.sent.isEmpty)
+    }
+
+    // MARK: abnormal session recovery
+
+    func testCleanShutdownDoesNotRecoverAbnormalOnNextStart() {
+        let store = MemoryStore()
+        let first = Recorder()
+        let tracker = makeTracker(store: store, recorder: first)
+        tracker.start()
+        tracker.end()
+
+        let second = Recorder()
+        makeTracker(store: store, recorder: second).start()
+
+        XCTAssertEqual(second.sent.filter { $0.path == "/ingest/v1/sessions/end" }.count, 0)
+        XCTAssertEqual(second.sent.filter { $0.path == "/ingest/v1/sessions/start" }.count, 1)
+    }
+
+    func testOpenSessionIsRecoveredAsAbnormalOnNextStart() {
+        let store = MemoryStore()
+        let session = makeTracker(store: store, recorder: Recorder()).start()
+
+        let second = Recorder()
+        makeTracker(store: store, recorder: second).start()
+
+        let recovered = second.sent.first { $0.path == "/ingest/v1/sessions/end" }?.body
+        XCTAssertEqual(recovered?["sessionId"] as? String, session.id)
+        XCTAssertEqual(recovered?["status"] as? String, "abnormal")
+    }
+
+    func testCrashedOpenSessionIsRecoveredAsCrashedOnNextStart() {
+        let store = MemoryStore()
+        let tracker = makeTracker(store: store, recorder: Recorder())
+        let session = tracker.start()
+        tracker.recordCrash()
+
+        let second = Recorder()
+        makeTracker(store: store, recorder: second).start()
+
+        let recovered = second.sent.first { $0.path == "/ingest/v1/sessions/end" }?.body
+        XCTAssertEqual(recovered?["sessionId"] as? String, session.id)
+        XCTAssertEqual(recovered?["status"] as? String, "crashed")
+    }
+
+    func testCorruptSessionStateIsClearedSafely() {
+        let store = MemoryStore(["version": 1, "bad": "shape"])
+        let rec = Recorder()
+        makeTracker(store: store, recorder: rec).start()
+        XCTAssertEqual(rec.sent.filter { $0.path == "/ingest/v1/sessions/end" }.count, 0)
+        XCTAssertEqual(rec.sent.filter { $0.path == "/ingest/v1/sessions/start" }.count, 1)
+    }
+
+    func testRecoveredAbnormalSessionIsNotReportedTwice() {
+        let store = MemoryStore()
+        makeTracker(store: store, recorder: Recorder()).start()
+
+        let second = Recorder()
+        let secondTracker = makeTracker(store: store, recorder: second)
+        secondTracker.start()
+        secondTracker.end()
+
+        let third = Recorder()
+        makeTracker(store: store, recorder: third).start()
+
+        XCTAssertEqual(second.sent.filter {
+            $0.path == "/ingest/v1/sessions/end" && $0.body["status"] as? String == "abnormal"
+        }.count, 1)
+        XCTAssertEqual(third.sent.filter {
+            $0.path == "/ingest/v1/sessions/end" && $0.body["status"] as? String == "abnormal"
+        }.count, 0)
     }
 
     // MARK: Session model unit semantics (mirrors the Java reference)

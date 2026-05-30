@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > and `AllStak.podspec`'s `spec.version` must match; bump them together on every
 > release. `AllStakVersionParityTests` enforces this at build time.
 
-## [Unreleased]
+## [0.2.0] - 2026-05-30
 
 ### Added
 
@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   async-signal-safe POSIX signal crash capture (SIGSEGV / SIGABRT / SIGBUS /
   SIGILL / SIGFPE / SIGTRAP). Both channels persist to disk and send on the next
   launch with the crash-time loaded-image layout.
-- **Scope.** Sentry-style scope: breadcrumbs, `user`, `tags`, `contexts`, and
+- **Scope.** AllStak scope model: breadcrumbs, `user`, `tags`, `contexts`, and
   `extra`, merged onto every event.
 - **Release health.** Automatic session tracking (start/end, crash-free
   sessions/users) with the resolved release stamped on events and sessions.
@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Outbound HTTP instrumentation.** Automatic `URLSession` breadcrumbs
   (method, query-stripped URL, status, duration, size) with W3C
   `traceparent` + `baggage` propagation; the ingest host is always skipped.
+- **Automatic UI / navigation / lifecycle breadcrumbs.** A `UIViewController`
+  `viewDidAppear` / `viewWillDisappear` swizzle records `navigation` + `ui`
+  breadcrumbs (controller class + title) and `NotificationCenter` observers emit
+  `app.lifecycle` breadcrumbs (active / inactive / foreground / background /
+  memory warning). iOS / tvOS only (`canImport(UIKit)`-guarded), fully fail-open
+  (forwards to the original implementations untouched), and a no-op under tests.
+  Gated by `enableAutoBreadcrumbs` (default on); HTTP is no longer the only
+  automatic breadcrumb source.
 - **Automatic release detection.** Explicit → `ALLSTAK_RELEASE` env → app
   `Info.plist` version → SDK version (never empty).
 - **Native symbolication support.** Instruction addresses + `debugMeta.images`
@@ -55,5 +63,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - On-device end-to-end verification of the live signal handler and the live
   app-hang / watchdog timers.
-- Performance tracing / spans, profiling, UI auto-instrumentation, attachments,
-  and screenshots.
+- Performance tracing / spans, profiling, attachments, and screenshots.

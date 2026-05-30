@@ -6,7 +6,7 @@ import Foundation
 public final class AllStakClient: @unchecked Sendable {
 
     static let sdkName = "allstak-apple"
-    static let sdkVersion = "0.1.0"
+    static let sdkVersion = "0.2.0"
     private static let maxFrames = 128
 
     /// `true` when the SDK is initialized inside a unit-test runtime, so session
@@ -41,8 +41,8 @@ public final class AllStakClient: @unchecked Sendable {
     static let pathErrors = "/ingest/v1/errors"
     static let pathReleases = "/ingest/v1/releases"
 
-    /// PII-scrubbing config. When `sendDefaultPii` is `false` (default, Sentry
-    /// parity) the email/IPv4 value scrubbers run in addition to the always-on
+    /// PII-scrubbing config. When `sendDefaultPii` is `false` (default) the
+    /// email/IPv4 value scrubbers run in addition to the always-on
     /// credit-card + SSN scrubbers and the key denylist.
     private let sanitizer: Sanitizer
 
@@ -151,6 +151,9 @@ public final class AllStakClient: @unchecked Sendable {
                 sdkVersion: Self.sdkVersion,
                 platform: "cocoa",
                 transportEnabled: !apiKey.isEmpty,
+                stateStore: UserDefaultsSessionStateStore(
+                    key: "allstak.session.v1.\((resolvedRelease ?? Self.sdkVersion).replacingOccurrences(of: "/", with: "_"))"
+                ),
                 sender: { [transport] path, body in
                     Self.postJSON(transport: transport, path: path, body: body)
                 })
@@ -238,7 +241,7 @@ public final class AllStakClient: @unchecked Sendable {
 
     /// Run `body` with a temporary scope cloned from the global scope; any
     /// `capture(...)` made inside the body (on this thread) uses that clone, and
-    /// the clone's mutations never touch the global scope (Sentry/JS `withScope`
+    /// the clone's mutations never touch the global scope (`withScope`
     /// isolation). The temporary scope is always popped, even if `body` throws.
     @discardableResult
     func withScope<T>(_ body: (Scope) throws -> T) rethrows -> T {
@@ -284,7 +287,7 @@ public final class AllStakClient: @unchecked Sendable {
         var event = AllStakErrorEvent(
             exceptionClass: exceptionClass,
             message: message,
-            // A scope `level` override wins over the call-site level (Sentry/JS
+            // A scope `level` override wins over the call-site level (standard
             // scope semantics).
             level: snapshot.level ?? level,
             platform: "cocoa",
@@ -331,7 +334,7 @@ public final class AllStakClient: @unchecked Sendable {
     /// Copy a scope snapshot onto an event. Empty maps/arrays are left `nil` so
     /// the encoder omits them and the existing wire shape is preserved when the
     /// scope is unused. The scope `level` (when set) overrides the event level,
-    /// mirroring the Sentry-cocoa / JS scope semantics.
+    /// following standard scope semantics.
     private func attachScope(_ s: Scope.Snapshot, to event: inout AllStakErrorEvent) {
         event.breadcrumbs = s.breadcrumbs.isEmpty ? nil : s.breadcrumbs
         event.user = s.user
@@ -491,7 +494,7 @@ public final class AllStakClient: @unchecked Sendable {
         transport.send(path: path, body: data)
     }
 
-    /// Install automatic outbound HTTP instrumentation (sentry-cocoa-style).
+    /// Install automatic outbound HTTP instrumentation.
     /// Records redacted `http` breadcrumbs into the client's scope and injects W3C
     /// trace headers using this client's per-launch ``traceId`` + the active
     /// release-health session id. Skips the SDK's own ingest host. Suppressed under
@@ -511,6 +514,17 @@ public final class AllStakClient: @unchecked Sendable {
                     sessionId: sessionProvider(),
                     sampled: true)
             })
+    }
+
+    /// Install automatic navigation / UI / app-lifecycle breadcrumbs into this
+    /// client's scope (auto-breadcrumbs). Swizzles
+    /// `UIViewController` appear/disappear and observes lifecycle notifications so
+    /// the breadcrumb trail reflects screen + app-state transitions with no
+    /// per-call code. iOS / tvOS only (guarded by `canImport(UIKit)` inside
+    /// ``AutoBreadcrumbs``), fail-open, and a no-op under XCTest. Re-pointing the
+    /// scope on a re-`start()` is supported.
+    func installAutoBreadcrumbs() {
+        AutoBreadcrumbs.shared.install(scope: scope)
     }
 
     /// Arm the live app-hang watchdog with the configured threshold. Each hang

@@ -4,7 +4,7 @@ Official AllStak SDK for Apple platforms (iOS / macOS / tvOS), Swift. Captures
 errors and reports them to AllStak with the data needed for **server-side dSYM
 symbolication**: native instruction addresses + the process's loaded-image UUIDs.
 
-> Status: early (0.1.0), dependency-free (Foundation / Darwin / MachO only — no
+> Status: early (0.2.0), dependency-free (Foundation / Darwin / MachO only — no
 > third-party pods). Installable via Swift Package Manager **or** CocoaPods (see
 > [Install](#install)). The full, current feature set is below.
 
@@ -23,7 +23,7 @@ What the SDK supports today (all our own code, Foundation-only):
   - Both channels are persisted to disk and sent on the **next launch** with the
     crash-time loaded-image layout.
   - Manual `AllStak.capture(error)` / `AllStak.capture(message:level:)`.
-- **Scope** — Sentry-style breadcrumbs, `user`, `tags`, `contexts`, and `extra`,
+- **Scope** — standard breadcrumbs, `user`, `tags`, `contexts`, and `extra`,
   merged onto every event.
 - **Release health** — automatic session tracking (start/end + crash-free
   sessions/users), with the resolved release stamped on every event/session.
@@ -35,37 +35,42 @@ What the SDK supports today (all our own code, Foundation-only):
 - **Outbound HTTP instrumentation** — automatic `URLSession` breadcrumbs
   (method, query-stripped URL, status, duration, size) with W3C
   `traceparent` + `baggage` propagation; the ingest host is always skipped.
+- **Automatic UI / navigation / lifecycle breadcrumbs** — `UIViewController`
+  appear/disappear (`navigation` + `ui` breadcrumbs with the screen's class and
+  title) and app-state transitions (`app.lifecycle` breadcrumbs:
+  active / inactive / foreground / background / memory warning). iOS / tvOS only,
+  default-on, opt-out via `enableAutoBreadcrumbs: false`.
 - **Automatic release detection** — explicit → `ALLSTAK_RELEASE` env → app
   `Info.plist` version → SDK version (never empty).
 - **Native symbolication support** — sends instruction addresses +
   `debugMeta.images` (`LC_UUID`s) for server-side dSYM resolution, plus a
   build-time **dSYM upload script** for CI.
 
-### Parity with sentry-cocoa (honest status)
+### Feature status (honest)
 
-Implemented above. **Still on the roadmap** (not yet in this SDK):
+Implemented above (now also including **app-hang / ANR** detection,
+**OOM / watchdog-termination** heuristics, and **MetricKit** ingestion).
+**Still on the roadmap** (not yet in this SDK):
 
-- **App-hang / ANR** detection (main-thread watchdog).
-- **OOM / watchdog-termination** heuristics and **MetricKit** ingestion.
 - **On-device E2E verification of the live signal handler.** The crash-record
   writer and the next-launch reader/parser are unit-tested; raising a real
   SIGSEGV in-process can't be done safely in CI, so the live handler still needs
   device verification.
-- Performance tracing / spans, profiling, view/UI auto-instrumentation, attachments,
-  and screenshots are out of scope for now.
+- Performance tracing / spans, profiling, attachments, and screenshots are out
+  of scope for now.
 
 ## Install
 
 ### Swift Package Manager
 
 ```swift
-.package(url: "https://github.com/AllStak/allstak-apple.git", from: "0.1.0")
+.package(url: "https://github.com/AllStak/allstak-apple.git", from: "0.2.0")
 ```
 
 ### CocoaPods
 
 ```ruby
-pod 'AllStak', '~> 0.1'
+pod 'AllStak', '~> 0.2'
 ```
 
 > The CocoaPods `spec.version` and the runtime `AllStakClient.sdkVersion`
@@ -108,6 +113,29 @@ internal failure the request is forwarded untouched. Opt out with:
 ```swift
 AllStak.start(apiKey: "astk_live_xxxxxxxx",
               enableAutoHttpInstrumentation: false)
+```
+
+## Automatic UI / navigation / lifecycle breadcrumbs
+
+On by default (iOS / tvOS), the SDK records breadcrumbs for what your app is
+*doing* — with no per-call code — so the trail attached to a captured event shows
+the screens and app-state transitions that led up to it:
+
+- **Navigation / UI** — `UIViewController.viewDidAppear` records a `navigation`
+  breadcrumb (the screen that became visible) and `viewWillDisappear` records a
+  `ui` breadcrumb (the screen that is leaving). Each carries the controller's
+  class name and, when set, its `title`.
+- **App lifecycle** — `app.lifecycle` breadcrumbs for `active` / `inactive` /
+  `foreground` / `background` / `memory_warning` transitions.
+
+This is fully fail-open: it forwards to the original `UIViewController`
+implementations untouched, only records class names and titles (no request
+bodies, URLs, or user input), and is a no-op on macOS / headless platforms and
+under tests. Opt out with:
+
+```swift
+AllStak.start(apiKey: "astk_live_xxxxxxxx",
+              enableAutoBreadcrumbs: false)
 ```
 
 ## Release identifier (automatic)

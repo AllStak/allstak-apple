@@ -6,7 +6,7 @@ import Foundation
 // records the time. The main thread, when it gets around to running the block,
 // stamps "I responded at T". If the watchdog observes that the most-recent ping
 // it sent has gone unanswered for longer than the configured threshold (default
-// 2.0s, Sentry-cocoa parity), the main thread is hung and an app-hang event is
+// 2.0s), the main thread is hung and an app-hang event is
 // recorded; when the main thread finally runs the outstanding block, the hang is
 // resolved/cleared.
 //

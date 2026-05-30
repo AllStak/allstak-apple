@@ -1,7 +1,7 @@
 import Foundation
 import ObjectiveC
 
-/// Automatic outbound HTTP instrumentation (sentry-cocoa-style).
+/// Automatic outbound HTTP instrumentation.
 ///
 /// A `URLProtocol` subclass — ``AllStakURLProtocol`` — observes the outbound
 /// requests the host app makes through `URLSession`, records a redacted `http`
@@ -12,7 +12,7 @@ import ObjectiveC
 /// format byte-for-byte consistent with the sibling SDKs
 /// (`allstak-js/src/modules/trace-propagation.ts`).
 ///
-/// Registration covers two surfaces, mirroring sentry-cocoa:
+/// Registration covers two surfaces:
 ///   1. `URLProtocol.registerClass` — catches `URLSession.shared` and any session
 ///      built from a default/ephemeral configuration without an explicit
 ///      `protocolClasses` list.
@@ -33,7 +33,7 @@ final class HTTPInstrumentation: @unchecked Sendable {
 
     /// Process-wide shared coordinator. `URLProtocol` is instantiated by
     /// Foundation with no access to our client, so the live configuration is read
-    /// from this singleton (sentry-cocoa uses the same global-hub pattern).
+    /// from this singleton via a global-hub pattern.
     static let shared = HTTPInstrumentation()
 
     private let lock = NSLock()
@@ -144,8 +144,8 @@ final class HTTPInstrumentation: @unchecked Sendable {
 /// transparently back to the client.
 ///
 /// A per-request marker property prevents the protocol from re-handling the
-/// request it itself forwards (infinite recursion guard), exactly like
-/// sentry-cocoa's `SentryNetworkTracker` URLProtocol pattern.
+/// request it itself forwards (infinite recursion guard), a standard
+/// `URLProtocol` interception pattern.
 final class AllStakURLProtocol: URLProtocol, @unchecked Sendable {
 
     /// Marker set on the request copy we forward so `canInit` declines it the

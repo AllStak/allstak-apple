@@ -5,7 +5,7 @@ import Foundation
 // Some app deaths give our handlers NO chance to run: the OS watchdog kills an
 // unresponsive app, or the kernel reclaims a memory-hungry app (OOM). These leave
 // no NSException and no POSIX signal — the process just vanishes. We infer them
-// the way sentry-cocoa does (`SentryWatchdogTerminationLogic`):
+// heuristically:
 //
 //   On launch we persist a run-state marker. We clear it on every *explained*
 //   exit: a clean termination, entering background, or a recorded crash. On the

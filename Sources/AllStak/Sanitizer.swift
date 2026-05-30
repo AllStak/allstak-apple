@@ -9,8 +9,8 @@ import Foundation
 ///      deny-list (`authorization`, `cookie`, `password`, `token`, `secret`,
 ///      `api_key`, `jwt`, `bearer`, `ssn`, `credit_card`, `cvv`, `session`, …)
 ///      have their value replaced with ``redactedMarker`` (`[REDACTED]`).
-///   2. **VALUE patterns** scanned inside string values (Sentry data-scrubbing
-///      parity):
+///   2. **VALUE patterns** scanned inside string values (value-pattern
+///      data-scrubbing):
 ///        - ALWAYS scrubbed: Luhn-valid credit-card numbers (13–19 digits) and
 ///          dashed US SSNs (`\d{3}-\d{2}-\d{4}`).
 ///        - Scrubbed UNLESS ``sendDefaultPii`` is `true`: email addresses and
@@ -37,7 +37,7 @@ struct Sanitizer: Sendable {
 
     /// When `true`, the email + IPv4 value scrubbers are disabled (the caller
     /// opted into PII). The credit-card + SSN scrubbers stay on regardless.
-    /// Default `false` (Sentry parity).
+    /// Default `false`.
     let sendDefaultPii: Bool
 
     let maxDepth: Int

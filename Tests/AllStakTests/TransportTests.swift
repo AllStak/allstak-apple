@@ -219,7 +219,7 @@ final class TransportTests: XCTestCase {
         XCTAssertEqual(spool.count(), 0, "accepted replays are removed from the spool")
     }
 
-    func testDrainSpoolKeepsEntryThatStillFails() {
+    func testDrainSpoolKeepsFailingEntry() {
         let dir = tempDir()
         let seed = EnvelopeSpool(directory: dir)
         seed.enqueue(path: "/ingest/v1/errors", payload: body("stubborn"), id: "stub",

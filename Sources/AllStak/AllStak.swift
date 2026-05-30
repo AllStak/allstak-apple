@@ -46,7 +46,7 @@ public enum AllStak {
     ///   one release-health session per app launch and ends it on graceful
     ///   shutdown (app termination / background→terminate). Set `false` to opt
     ///   out. Session tracking is always fail-open and never blocks launch.
-    /// - Parameter sendDefaultPii: when `false` (default, Sentry parity) email
+    /// - Parameter sendDefaultPii: when `false` (default) email
     ///   and IPv4 addresses found inside string values are redacted before the
     ///   event is sent, in addition to the always-on credit-card + SSN scrubbers
     ///   and the sensitive-key denylist. Set `true` to allow email/IP through
@@ -60,6 +60,17 @@ public enum AllStak {
     ///   trace context exists — attaching W3C `traceparent` + `baggage` headers for
     ///   distributed tracing. The SDK's own ingest host is always skipped. Set
     ///   `false` to opt out. Fully fail-open; never breaks the host's networking.
+    /// - Parameter enableAutoBreadcrumbs: when `true` (default) the SDK records
+    ///   automatic breadcrumbs for UI/navigation and app-lifecycle transitions
+    ///   with no per-call code: it swizzles `UIViewController.viewDidAppear` /
+    ///   `viewWillDisappear` (a `navigation` breadcrumb when a screen appears, a
+    ///   `ui` breadcrumb when one leaves, carrying the controller class + title)
+    ///   and observes the app-lifecycle notifications to emit `app.lifecycle`
+    ///   breadcrumbs (active / inactive / foreground / background / memory
+    ///   warning). iOS / tvOS only (guarded by `canImport(UIKit)`), fully
+    ///   fail-open, and a no-op under XCTest and on headless platforms. Set
+    ///   `false` to opt out; the existing automatic HTTP breadcrumb source is
+    ///   unaffected.
     /// - Parameter beforeSend: a final filter run on every event at the wire
     ///   chokepoint, BEFORE PII scrubbing. Return `nil` to drop the event, or a
     ///   (possibly mutated) event to send. The hook sees real, un-scrubbed data;
@@ -71,7 +82,7 @@ public enum AllStak {
     ///   thread recovers. Fully fail-open; never freezes the host. A no-op on
     ///   headless platforms and under XCTest.
     /// - Parameter appHangTimeoutInterval: the unresponsiveness threshold in
-    ///   seconds before an app hang is reported. Default `2.0` (Sentry parity).
+    ///   seconds before an app hang is reported. Default `2.0`.
     /// - Parameter enableWatchdogTerminationTracking: when `true` (default) the
     ///   SDK persists a run-state marker each launch and, on the NEXT launch,
     ///   infers a watchdog / OOM termination (`watchdog_termination` mechanism) if
@@ -96,6 +107,7 @@ public enum AllStak {
                              appHangTimeoutInterval: TimeInterval = 2.0,
                              enableWatchdogTerminationTracking: Bool = true,
                              enableMetricKit: Bool = true,
+                             enableAutoBreadcrumbs: Bool = true,
                              sendDefaultPii: Bool = false,
                              beforeSend: (@Sendable (AllStakErrorEvent) -> AllStakErrorEvent?)? = nil) {
         lock.lock()
@@ -168,6 +180,15 @@ public enum AllStak {
             newClient.installHTTPInstrumentation()
         } else {
             HTTPInstrumentation.shared.disable()
+        }
+
+        // Install automatic navigation / UI / app-lifecycle breadcrumbs
+        // (UIViewController appear/disappear swizzle + lifecycle observers).
+        // iOS/tvOS only, fail-open, and a no-op under XCTest.
+        if enableAutoBreadcrumbs {
+            newClient.installAutoBreadcrumbs()
+        } else {
+            AutoBreadcrumbs.shared.disable()
         }
     }
 
@@ -301,7 +322,7 @@ public enum AllStak {
         current()?.setExtras(extras)
     }
 
-    /// Mutate the global scope inline (Sentry-cocoa `configureScope`).
+    /// Mutate the global scope inline via `configureScope`.
     public static func configureScope(_ block: (Scope) -> Void) {
         current()?.configureScope(block)
     }

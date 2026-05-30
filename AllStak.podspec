@@ -12,11 +12,11 @@
 #
 Pod::Spec.new do |spec|
   spec.name         = "AllStak"
-  spec.version      = "0.1.0" # keep in sync with AllStakClient.sdkVersion
+  spec.version      = "0.2.0" # keep in sync with AllStakClient.sdkVersion
   spec.summary      = "Official AllStak SDK for Apple platforms (iOS / macOS / tvOS)."
   spec.description  = <<-DESC
     Crash + error reporting for Apple apps: uncaught NSException and
-    async-signal-safe POSIX signal capture, Sentry-style scope (breadcrumbs /
+    async-signal-safe POSIX signal capture, scoped context (breadcrumbs /
     user / tags / contexts), release-health sessions, PII scrubbing with a
     beforeSend hook, a reliable transport with offline persistence and
     retry/backoff, automatic outbound URLSession instrumentation, and native

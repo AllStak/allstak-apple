@@ -42,12 +42,11 @@ public struct OpenSessionMarker: Codable, Sendable, Equatable {
 /// AND no crash was recorded AND the prior run was in the foreground, the prior
 /// process was killed by the OS without a chance to run our handlers — a
 /// watchdog / out-of-memory termination — and is reported on this launch with a
-/// distinct `"watchdog_termination"` mechanism. Mirrors sentry-cocoa's
-/// `SentryAppStateManager` / `SentryWatchdogTerminationLogic`.
+/// distinct `"watchdog_termination"` mechanism.
 public struct AppRunStateMarker: Codable, Sendable, Equatable {
     /// Resolved release at the time the marker was written. A different release
     /// on the next launch implies an app *update* between runs, which is NOT a
-    /// watchdog termination (Sentry parity) — avoids a false positive.
+    /// watchdog termination — avoids a false positive.
     public let release: String?
     /// OS version when the marker was written. A different OS version implies an
     /// OS update between runs — also not a watchdog termination.

@@ -2,12 +2,12 @@ import Foundation
 
 /// A user associated with captured events. Mirrors the backend
 /// `ErrorIngestRequest.UserContext` (`id` / `email` / `ip`); `username` is kept
-/// SDK-side for parity with Sentry-cocoa but is not part of the wire contract.
+/// SDK-side as a convenience field but is not part of the wire contract.
 public struct AllStakUser: Codable, Sendable, Equatable {
     public var id: String?
     public var email: String?
     public var ip: String?
-    /// SDK-side only (Sentry-cocoa parity). Not part of the backend
+    /// SDK-side only. Not part of the backend
     /// `UserContext` wire contract, so it is intentionally not encoded.
     public var username: String?
 
@@ -50,7 +50,7 @@ public struct AllStakBreadcrumb: Codable, Sendable, Equatable {
     }
 }
 
-/// Sentry-cocoa-style scope: thread-safe, holds the contextual data attached to
+/// Scoped context: thread-safe, holds the contextual data attached to
 /// captured events — a breadcrumb ring buffer, the active user, tags, named
 /// contexts, free-form extra, a level override, and a fingerprint.
 ///
@@ -60,7 +60,7 @@ public struct AllStakBreadcrumb: Codable, Sendable, Equatable {
 /// snapshot. Fail-open throughout — nothing here ever throws into the host app.
 public final class Scope: @unchecked Sendable {
 
-    /// Default breadcrumb ring-buffer capacity (Sentry-cocoa default).
+    /// Default breadcrumb ring-buffer capacity.
     public static let defaultMaxBreadcrumbs = 100
 
     private let lock = NSLock()

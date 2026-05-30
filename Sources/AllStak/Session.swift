@@ -3,7 +3,7 @@ import Foundation
 /// Lifecycle status of a release-health session.
 ///
 /// Vocabulary matches the AllStak backend's `/ingest/v1/sessions/end` contract
-/// and Sentry's release-health conventions (mirrors the Java SDK
+/// and standard release-health conventions (mirrors the Java SDK
 /// `dev.allstak.session.SessionStatus`):
 ///
 /// - ``ok`` — session ended normally with at most non-fatal logs.
@@ -23,7 +23,35 @@ enum SessionStatus: String, Codable, Sendable {
     var wireValue: String { rawValue }
 }
 
-/// A single release-health session. One-per-process / app-launch (Sentry-style).
+protocol SessionStateStore: AnyObject {
+    func read() -> [String: Any]?
+    func write(_ state: [String: Any])
+    func clear()
+}
+
+final class UserDefaultsSessionStateStore: SessionStateStore {
+    private let defaults: UserDefaults
+    private let key: String
+
+    init(defaults: UserDefaults = .standard, key: String) {
+        self.defaults = defaults
+        self.key = key
+    }
+
+    func read() -> [String: Any]? {
+        defaults.dictionary(forKey: key)
+    }
+
+    func write(_ state: [String: Any]) {
+        defaults.set(state, forKey: key)
+    }
+
+    func clear() {
+        defaults.removeObject(forKey: key)
+    }
+}
+
+/// A single release-health session. One-per-process / app-launch.
 ///
 /// Mirrors the Java SDK `dev.allstak.session.Session`: status escalates
 /// `ok → errored → crashed` and never downgrades. Mutation is guarded by a lock
@@ -110,10 +138,16 @@ final class SessionTracker: @unchecked Sendable {
     private let platform: String
     private let transportEnabled: Bool
     private let sender: Sender
+    private let stateStore: SessionStateStore?
 
     private let lock = NSLock()
     private var active: Session?
     private var ended = false
+
+    private static let stateVersion = 1
+    private static let stateMaxAge: TimeInterval = 7 * 24 * 60 * 60
+    private static let recoveryLockSeconds: TimeInterval = 30
+    private static let recoveryMaxAttempts = 3
 
     init(release: String,
          environment: String?,
@@ -121,6 +155,7 @@ final class SessionTracker: @unchecked Sendable {
          sdkVersion: String,
          platform: String,
          transportEnabled: Bool,
+         stateStore: SessionStateStore? = nil,
          sender: @escaping Sender) {
         self.release = release
         self.environment = environment
@@ -128,6 +163,7 @@ final class SessionTracker: @unchecked Sendable {
         self.sdkVersion = sdkVersion
         self.platform = platform
         self.transportEnabled = transportEnabled
+        self.stateStore = stateStore
         self.sender = sender
     }
 
@@ -145,6 +181,8 @@ final class SessionTracker: @unchecked Sendable {
         active = session
         let enabled = transportEnabled
         lock.unlock()
+        recoverPreviousSession()
+        writeOpenState(session, userId: userId)
 
         // Transport disabled (missing/blank key): keep the in-memory tracker so
         // errored/crashed transitions still set a sensible final status, but skip
@@ -176,6 +214,7 @@ final class SessionTracker: @unchecked Sendable {
     func recordError() {
         lock.lock(); let s = ended ? nil : active; lock.unlock()
         s?.recordError()
+        if let s { writeOpenState(s, userId: nil) }
     }
 
     /// Record an unhandled crash against the active session. No I/O — the
@@ -183,6 +222,7 @@ final class SessionTracker: @unchecked Sendable {
     func recordCrash() {
         lock.lock(); let s = ended ? nil : active; lock.unlock()
         s?.recordCrash()
+        if let s { writeOpenState(s, userId: nil) }
     }
 
     /// Terminate the session and POST `/sessions/end`. Idempotent. When
@@ -197,6 +237,7 @@ final class SessionTracker: @unchecked Sendable {
         lock.unlock()
 
         let status = finalStatus ?? session.status
+        writeClosedState(session, status: status)
         guard enabled else { return }
 
         let body: [String: Any?] = [
@@ -205,5 +246,91 @@ final class SessionTracker: @unchecked Sendable {
             "status": status.wireValue,
         ]
         sender(Self.pathEnd, body)
+    }
+
+    private func recoverPreviousSession() {
+        guard let store = stateStore, var state = store.read() else { return }
+        let now = Date()
+        if state["closed"] as? Bool == true {
+            store.clear()
+            return
+        }
+        guard let startedAtMs = state["startedAt"] as? Double else {
+            store.clear()
+            return
+        }
+        let startedAt = Date(timeIntervalSince1970: startedAtMs / 1000)
+        if now.timeIntervalSince(startedAt) > Self.stateMaxAge {
+            store.clear()
+            return
+        }
+        let attempts = state["recoveryAttempts"] as? Int ?? 0
+        if attempts >= Self.recoveryMaxAttempts {
+            store.clear()
+            return
+        }
+        let lockUntilMs = state["recoveryLockUntil"] as? Double ?? 0
+        if lockUntilMs > now.timeIntervalSince1970 * 1000 { return }
+
+        let owner = UUID().uuidString
+        state["recoveryAttempts"] = attempts + 1
+        state["recoveryLockOwner"] = owner
+        state["recoveryLockUntil"] = now.addingTimeInterval(Self.recoveryLockSeconds).timeIntervalSince1970 * 1000
+        state["updatedAt"] = now.timeIntervalSince1970 * 1000
+        store.write(state)
+        guard store.read()?["recoveryLockOwner"] as? String == owner else { return }
+
+        let status: SessionStatus = (state["status"] as? String) == SessionStatus.crashed.wireValue ? .crashed : .abnormal
+        let updatedAtMs = state["updatedAt"] as? Double ?? now.timeIntervalSince1970 * 1000
+        let body: [String: Any?] = [
+            "sessionId": state["sessionId"],
+            "durationMs": max(0, Int(updatedAtMs - startedAtMs)),
+            "status": status.wireValue,
+        ]
+        if transportEnabled {
+            sender(Self.pathEnd, body)
+        }
+        state["status"] = status.wireValue
+        state["closed"] = true
+        state["endedAt"] = now.timeIntervalSince1970 * 1000
+        state["recoveredAt"] = now.timeIntervalSince1970 * 1000
+        state["recoveryLockUntil"] = 0
+        store.write(state)
+    }
+
+    private func writeOpenState(_ session: Session, userId: String?) {
+        var state: [String: Any] = [
+            "version": Self.stateVersion,
+            "sessionId": session.id,
+            "startedAt": session.startedAt.timeIntervalSince1970 * 1000,
+            "updatedAt": Date().timeIntervalSince1970 * 1000,
+            "status": session.status.wireValue,
+            "release": release,
+            "sdkName": sdkName,
+            "sdkVersion": sdkVersion,
+            "platform": platform,
+            "closed": false,
+        ]
+        if let environment { state["environment"] = environment }
+        if let userId { state["userId"] = userId }
+        stateStore?.write(state)
+    }
+
+    private func writeClosedState(_ session: Session, status: SessionStatus) {
+        var state: [String: Any] = [
+            "version": Self.stateVersion,
+            "sessionId": session.id,
+            "startedAt": session.startedAt.timeIntervalSince1970 * 1000,
+            "updatedAt": Date().timeIntervalSince1970 * 1000,
+            "status": status.wireValue,
+            "release": release,
+            "sdkName": sdkName,
+            "sdkVersion": sdkVersion,
+            "platform": platform,
+            "closed": true,
+            "endedAt": Date().timeIntervalSince1970 * 1000,
+        ]
+        if let environment { state["environment"] = environment }
+        stateStore?.write(state)
     }
 }
