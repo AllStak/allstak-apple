@@ -55,9 +55,15 @@ final class MetricKitSubscriber: NSObject, MXMetricManagerSubscriber, @unchecked
 
     // MARK: MXMetricManagerSubscriber
 
+    // `MXMetricPayload` (and this `didReceive` overload) is unavailable on
+    // macOS, so it can only be declared where the type exists. It is an
+    // *optional* protocol requirement and we ignore metric payloads anyway
+    // (we only consume diagnostics), so omitting it on macOS is a no-op.
+    #if !os(macOS)
     func didReceive(_ payloads: [MXMetricPayload]) {
         // We only consume diagnostics; metric payloads are ignored.
     }
+    #endif
 
     @available(iOS 14.0, macOS 12.0, *)
     func didReceive(_ payloads: [MXDiagnosticPayload]) {
