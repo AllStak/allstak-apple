@@ -29,7 +29,7 @@ Pod::Spec.new do |spec|
 
   spec.source       = {
     :git => "https://github.com/AllStak/allstak-apple.git",
-    :tag => spec.version.to_s
+    :tag => "v#{spec.version}"
   }
 
   # Platforms — must match Package.swift.

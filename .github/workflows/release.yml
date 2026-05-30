@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+jobs:
+  publish:
+    name: Publish to CocoaPods Trunk
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify podspec version matches tag
+        if: github.event_name == 'push'
+        run: |
+          POD_VERSION="$(grep -E 'spec\.version\s*=' AllStak.podspec | head -1 | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$POD_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::podspec version ($POD_VERSION) does not match tag ($TAG_VERSION)"
+            exit 1
+          fi
+
+      - name: Lint podspec
+        run: pod lib lint AllStak.podspec --allow-warnings --skip-tests
+
+      - name: Push to CocoaPods Trunk
+        env:
+          COCOAPODS_TRUNK_TOKEN: ${{ secrets.COCOAPODS_TRUNK_TOKEN }}
+        run: pod trunk push AllStak.podspec --allow-warnings --skip-tests
