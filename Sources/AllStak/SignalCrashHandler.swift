@@ -339,7 +339,7 @@ enum SignalCrashHandler {
         g_altStack = stack
         var ss = stack_t()
         ss.ss_sp = stack
-        ss.ss_size = stackSize
+        ss.ss_size = numericCast(stackSize)
         ss.ss_flags = 0
         _ = sigaltstack(&ss, nil)
         #endif
